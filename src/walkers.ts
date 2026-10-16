@@ -88,8 +88,6 @@ export class WalkerMarkers {
         this.ticking = true;
         try {
             await this.step();
-        } catch (err) {
-            console.warn("[paper-stage] walker markers failed", err);
         } finally {
             this.ticking = false;
             const delay = this.nextDelay();
