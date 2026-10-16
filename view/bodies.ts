@@ -29,10 +29,10 @@ export class Bodies {
     readonly root = new Group();
     private readonly bodies = new Map<ConnectionId, Body>();
 
-    /** Replaces every body, as a welcome does. */
-    reset(walkers: Walker[], frame: Rect, now: number): void {
+    /** Replaces every body, as a welcome does. A stage with no frame yet shows none. */
+    reset(walkers: Walker[], frame: Rect | null, now: number): void {
         for (const id of [...this.bodies.keys()]) this.remove(id);
-        for (const walker of walkers) this.set(walker, frame, now);
+        if (frame) for (const walker of walkers) this.set(walker, frame, now);
     }
 
     set(walker: Walker, frame: Rect, now: number): void {

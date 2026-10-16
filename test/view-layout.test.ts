@@ -8,6 +8,8 @@ import {
     floorBounds,
     handPlan,
     moveWalker,
+    refloor,
+    settleWalker,
     wallEdges,
     wallPlan,
     wallToWorld,
@@ -122,6 +124,62 @@ describe("walls", () => {
         const narrow: Rect = { x: 0, y: 0, width: 30, height: 800 };
         const end = moveWalker({ x: 0.1, z: 0 }, { x: 1, z: 0 }, [], floorBounds(narrow));
         expect(end.x).toBeCloseTo(0, 6);
+    });
+});
+
+describe("settling a walker after the stage changes", () => {
+    const home = { x: -5, z: 3 };
+    const settle = (at: Point, walls: WallItem[], within = bounds) =>
+        settleWalker(
+            at,
+            home,
+            walls.flatMap((w) => wallEdges(wallPlan(w, frame))),
+            within,
+        );
+
+    it("leaves a walker where it stands when it is clear", () => {
+        expect(settle({ x: 1, z: 1 }, [wall(centered(400, 10))])).toEqual({ x: 1, z: 1 });
+    });
+
+    it("leaves a walker resting in a tight corner it walked into", () => {
+        const leaning = wall({ x: 1975, y: 2400 + 75 * Math.sqrt(3) - 6, width: 300, height: 12 }, "rect", -Math.PI / 3);
+        let p = { x: 6 - WALKER_RADIUS_M, z: 3 };
+        for (let frame = 0; frame < 120; frame++) p = walk(p, { x: 0.02, z: -0.04 }, [leaning]);
+        const end = settle(p, [leaning]);
+        expect(Math.hypot(end.x - p.x, end.z - p.z)).toBeLessThan(0.01);
+    });
+
+    it("moves a walker out of a wall drawn over it, to the side it was nearer", () => {
+        const end = settle({ x: 1, z: -0.02 }, [wall(centered(400, 12))]);
+        const touching = -WALL_THICKNESS_M / 2 - WALKER_RADIUS_M;
+        expect(end.x).toBeCloseTo(1, 5);
+        expect(end.z).toBeLessThanOrEqual(touching);
+        expect(end.z).toBeGreaterThan(touching - WALKER_RADIUS_M / 4);
+    });
+
+    it("brings a walker back onto a floor that shrank", () => {
+        const shrunk = floorBounds({ ...frame, x: 1300, width: 600 });
+        expect(settle({ x: 5, z: 0 }, [], shrunk)).toEqual({ x: 3 - WALKER_RADIUS_M, z: 0 });
+    });
+
+    it("sends a walker home when no spot nearby is clear", () => {
+        const slats = Array.from({ length: 13 }, (_, k) =>
+            wall({ x: 1300, y: 2400 + (k - 6) * 40 - 6, width: 700, height: 12 }),
+        );
+        expect(settle({ x: 0, z: 0.05 }, slats)).toEqual(home);
+    });
+});
+
+describe("a frame that changes under a walker", () => {
+    it("keeps the walker on the same board spot when the frame is resized", () => {
+        const grown: Rect = { x: 800, y: 2000, width: 1400, height: 900 };
+        const at = refloor({ x: 1, z: -1 }, frame, grown);
+        expect(at.x).toBeCloseTo(canvasToWorld(1700, 2300, grown).x, 9);
+        expect(at.z).toBeCloseTo(canvasToWorld(1700, 2300, grown).z, 9);
+    });
+
+    it("carries the walker along when the frame moves with everything in it", () => {
+        expect(refloor({ x: 1, z: -1 }, frame, { ...frame, x: 4000, y: -300 })).toEqual({ x: 1, z: -1 });
     });
 });
 

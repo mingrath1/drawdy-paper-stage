@@ -4,6 +4,7 @@ import {
     boardRotationToYaw,
     canvasToWorld,
     rectCenterToWorld,
+    worldToCanvas,
     type Cursor,
     type Rect,
     type StageItem,
@@ -155,18 +156,68 @@ function onFloor(p: Point, { minX, maxX, minZ, maxZ }: Bounds, radius: number): 
     return { x: within(p.x, minX + radius, maxX - radius), z: within(p.z, minZ + radius, maxZ - radius) };
 }
 
-function pushOut(p: Point, { a, b }: Segment, radius: number): Point {
+function pushOut(p: Point, edge: Segment, radius: number): Point {
+    const q = nearestOn(edge, p);
+    const dx = p.x - q.x;
+    const dz = p.z - q.z;
+    const distance = Math.hypot(dx, dz);
+    if (distance >= radius || distance === 0) return p;
+    return { x: q.x + (dx / distance) * radius, z: q.z + (dz / distance) * radius };
+}
+
+function nearestOn({ a, b }: Segment, p: Point): Point {
     const abx = b.x - a.x;
     const abz = b.z - a.z;
     const lengthSq = abx * abx + abz * abz;
     const t = lengthSq === 0 ? 0 : clamp(((p.x - a.x) * abx + (p.z - a.z) * abz) / lengthSq, 0, 1);
-    const qx = a.x + abx * t;
-    const qz = a.z + abz * t;
-    const dx = p.x - qx;
-    const dz = p.z - qz;
-    const distance = Math.hypot(dx, dz);
-    if (distance >= radius || distance === 0) return p;
-    return { x: qx + (dx / distance) * radius, z: qz + (dz / distance) * radius };
+    return { x: a.x + abx * t, z: a.z + abz * t };
+}
+
+const SETTLE_REACH_M = 2;
+const SETTLE_DIRECTIONS = 16;
+
+/**
+ * Where a walker belongs after the stage changed under it, as when a wall is drawn over it or the floor shrinks. A
+ * walker on the floor and less than half inside any wall stays put, so one resting snug in a corner does not creep. A
+ * stranded walker moves to the nearest clear spot within SETTLE_REACH_M, or back to `home` when there is none.
+ */
+export function settleWalker(
+    at: Point,
+    home: Point,
+    edges: Segment[],
+    bounds: Bounds,
+    radius = WALKER_RADIUS_M,
+): Point {
+    const clearance = (p: Point) => Math.min(...edges.map((edge) => distance(p, nearestOn(edge, p))));
+    const floored = onFloor(at, bounds, radius);
+    if (distance(floored, at) < 1e-9 && clearance(at) > radius / 2) return at;
+    for (let reach = 0; reach <= SETTLE_REACH_M; reach += radius / 4) {
+        for (let i = 0; i < SETTLE_DIRECTIONS; i++) {
+            const angle = (i / SETTLE_DIRECTIONS) * Math.PI * 2;
+            const spot = onFloor(
+                { x: floored.x + reach * Math.cos(angle), z: floored.z + reach * Math.sin(angle) },
+                bounds,
+                radius,
+            );
+            if (clearance(spot) >= radius) return spot;
+        }
+    }
+    return moveWalker(home, { x: 0, z: 0 }, edges, bounds, radius);
+}
+
+function distance(a: Point, b: Point): number {
+    return Math.hypot(a.x - b.x, a.z - b.z);
+}
+
+/**
+ * Where a floor point lands when the frame changes. Moving a frame carries everything in it along, so the point keeps
+ * its place on the floor. Resizing a frame leaves its contents where they were on the board, so the point keeps its
+ * board position.
+ */
+export function refloor(p: Point, from: Rect, to: Rect): Point {
+    if (from.width === to.width && from.height === to.height) return p;
+    const { x, y } = worldToCanvas(p.x, p.z, from);
+    return canvasToWorld(x, y, to);
 }
 
 export type CutoutPlan = { center: Point; width: number; height: number };

@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Rect, StageItem, StageSnapshot } from "../shared/protocol";
+import { canvasToWorld, worldToCanvas, type Rect, type StageItem, type StageSnapshot } from "../shared/protocol";
 import { AssetCache } from "../view/assets";
 import { StageModel } from "../view/stage";
+import { WalkControls } from "../view/walk";
 import { DirectionalLight, Mesh, Texture, Vector3, type Object3D } from "../view/vendor/three.module.js";
 
 /** Just enough of a canvas for the view's drawings to run in Node. Nothing is drawn. */
@@ -23,9 +24,21 @@ function fakeCanvas() {
     return { width: 0, height: 0, getContext: () => context };
 }
 
+/** A canvas element that records its listeners so a test can fire pointer events at it. */
+function fakeSurface() {
+    const listeners = new Map<string, (event: object) => void>();
+    const element = {
+        addEventListener: (type: string, listener: (event: object) => void) => listeners.set(type, listener),
+        setPointerCapture() {},
+    };
+    return { element: element as unknown as HTMLElement, fire: (type: string, event: object) => listeners.get(type)?.(event) };
+}
+
 beforeEach(() => {
     vi.stubGlobal("document", { createElement: fakeCanvas });
     vi.stubGlobal("Path2D", class { arc() {} roundRect() {} });
+    vi.stubGlobal("addEventListener", () => {});
+    vi.stubGlobal("focus", () => {});
 });
 afterEach(() => vi.unstubAllGlobals());
 
@@ -175,5 +188,56 @@ describe("cutouts facing the viewer", () => {
         const fromNorth = casters({ x: 0, z: -3 });
         expect(fromEast).toHaveLength(1);
         expect(fromNorth[0].equals(fromEast[0])).toBe(true);
+    });
+});
+
+describe("where the walker stands", () => {
+    const pawn: StageItem = { kind: "pawn", id: "pawn", x: 300, y: 600 };
+
+    it("waits out a new stage's empty frame and spawns at the pawn once the writer commits", () => {
+        const { stage } = stageHarness();
+        const walk = new WalkControls(fakeSurface().element);
+        stage.load({ revision: 0, frame: { x: 0, y: 0, width: 0, height: 0 }, items: [] });
+        walk.settle(stage, null);
+        expect(stage.frame).toBeNull();
+        const before = stage.frame;
+        stage.apply({ reset: true, frame, upserts: [pawn], removes: [] });
+        walk.settle(stage, before);
+        expect(walk.position).toEqual(canvasToWorld(300, 600, frame));
+    });
+
+    it("keeps where it walked across a reconnect, and steps clear of a wall drawn onto it", () => {
+        const { stage } = stageHarness();
+        const walk = new WalkControls(fakeSurface().element);
+        stage.load(snapshot([pawn]));
+        walk.settle(stage, null);
+        walk.position = { x: 2, z: 1 };
+        stage.load(snapshot([pawn]));
+        walk.settle(stage, frame);
+        expect(walk.position).toEqual({ x: 2, z: 1 });
+        const across: StageItem = {
+            kind: "wall",
+            id: "w",
+            shape: "rect",
+            rotation: 0,
+            rect: { x: 700, y: 494, width: 200, height: 12 },
+        };
+        stage.apply({ upserts: [across], removes: [] });
+        walk.settle(stage, frame);
+        expect(Math.abs(walk.position.z - 1)).toBeGreaterThanOrEqual(0.31);
+    });
+
+    it("keeps its spot on the board when the frame is resized under it", () => {
+        const { stage } = stageHarness();
+        const walk = new WalkControls(fakeSurface().element);
+        stage.load(snapshot([pawn]));
+        walk.settle(stage, null);
+        const spot = worldToCanvas(walk.position.x, walk.position.z, frame);
+        const grown: Rect = { x: -400, y: 0, width: 1600, height: 800 };
+        stage.apply({ frame: grown, upserts: [], removes: [] });
+        walk.settle(stage, frame);
+        const after = worldToCanvas(walk.position.x, walk.position.z, grown);
+        expect(after.x).toBeCloseTo(spot.x, 6);
+        expect(after.y).toBeCloseTo(spot.y, 6);
     });
 });

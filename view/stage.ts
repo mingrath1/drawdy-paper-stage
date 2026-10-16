@@ -289,6 +289,7 @@ export class StageModel {
         for (const node of this.nodes.values()) this.snap(node);
     }
 
+    /** A frame with no area, as a new stage has before its writer's first commit, leaves the frame as it was. */
     apply(patch: ScenePatch): void {
         if (patch.frame) this.setFrame(patch.frame);
         const frame = this.frame;
@@ -384,6 +385,7 @@ export class StageModel {
     }
 
     private setFrame(frame: Rect): void {
+        if (!(frame.width > 0 && frame.height > 0)) return;
         this.frame = frame;
         this.edgesStale = true;
         const { minX, maxX, minZ, maxZ } = floorBounds(frame);

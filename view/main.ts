@@ -58,28 +58,26 @@ const hands = new Hands(boot.participant.presenceId);
 scene.add(stage.root, bodies.root, hands.root);
 
 const walk = new WalkControls(canvas);
-let spawned = false;
 let poseClock = IDLE_POSE_CLOCK;
 let connectionId = "";
 
 const HANDLERS: { [K in ServerMessage["type"]]: (message: Extract<ServerMessage, { type: K }>) => void } = {
     welcome(message) {
         connectionId = message.connectionId;
+        const before = stage.frame;
         stage.load(message.snapshot);
-        const frame = message.snapshot.frame;
+        walk.settle(stage, before);
         bodies.reset(
             message.walkers.filter((w) => w.connectionId !== connectionId),
-            frame,
+            stage.frame,
             performance.now(),
         );
-        if (!spawned) {
-            walk.spawn(stage.pawn ?? { x: 0, z: 0 }, stage.collisionEdges, stage.bounds);
-            spawned = true;
-        }
         poseClock = IDLE_POSE_CLOCK;
     },
     "scene.patch"(message) {
+        const before = stage.frame;
         stage.apply(message);
+        walk.settle(stage, before);
     },
     walker(message) {
         if (stage.frame && message.walker.connectionId !== connectionId)
