@@ -40,13 +40,14 @@ export const ROLE_META_KEY = "paperStageRole";
 
 const ROLE_BY_META = new Map<unknown, StageRole>([["pawn", "pawn"]]);
 
-// Drawdy reads every shape, line and arrow back as "path". Lines, arrows and other shapes carry no componentType,
-// so they have no row here and are ignored.
+// Drawdy reads every shape, line and arrow back as "path". Triangles, stars, lines and arrows carry no componentType,
+// and Drawdy turns pencil strokes into such shapes, so a bare "path" stands up as a drawing.
 const ROLE_BY_KIND = new Map<string, StageRole>([
     ["path/rect", "wall"],
     ["path/circle", "wall"],
     ["path/diamond", "wall"],
     ["path/sticky-note", "cutout"],
+    ["path", "cutout"],
     ["freedraw", "cutout"],
     ["text", "cutout"],
     ["image", "cutout"],

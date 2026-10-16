@@ -31,7 +31,7 @@ describe("classify", () => {
         [{ type: "text" }, "cutout"],
         [{ type: "image" }, "cutout"],
         [{ type: "path", componentType: "circle", meta: { paperStageRole: "pawn" } }, "pawn"],
-        [{ type: "path" }, null],
+        [{ type: "path" }, "cutout"],
         [{ type: "frame" }, null],
         [{ type: "component" }, null],
         [{ type: "path", componentType: "rect", meta: { paperStageRole: "something-else" } }, "wall"],
@@ -114,7 +114,7 @@ describe("projectStage", () => {
                     [140, 120],
                 ],
             }),
-            el("line", { type: "path" }),
+            el("triangle", { type: "path" }),
             el("outside", { type: "path", componentType: "rect", x: 2000 }),
         );
         const projection = projectStage(state)!;
@@ -123,6 +123,7 @@ describe("projectStage", () => {
             ["pawn", "pawn"],
             ["wall", "wall"],
             ["cutout", "doodle"],
+            ["cutout", "triangle"],
         ]);
         expect(projection.items[0]).toEqual({ kind: "pawn", id: "pawn", x: 218, y: 218 });
         expect(projection.items[1]).toMatchObject({
