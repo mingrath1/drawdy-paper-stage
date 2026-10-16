@@ -208,17 +208,25 @@ function onScene(event: SceneEvent): void {
 }
 
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
+let flushDue = 0;
 let flushing = false;
-let flushAgain = false;
+/** When a flush asked for while one runs should start; null when none was asked for. */
+let flushAgainAt: number | null = null;
 let lastFlush = 0;
 
+/** Flushes after `delay`, or sooner when an earlier flush is already due. */
 function scheduleFlush(delay = 0): void {
+    const due = Math.max(Date.now() + delay, lastFlush + FLUSH_MS);
     if (flushing) {
-        flushAgain = true;
+        flushAgainAt = Math.min(flushAgainAt ?? due, due);
         return;
     }
-    if (flushTimer) return;
-    flushTimer = setTimeout(runFlush, Math.max(delay, lastFlush + FLUSH_MS - Date.now(), 0));
+    if (flushTimer) {
+        if (flushDue <= due) return;
+        clearTimeout(flushTimer);
+    }
+    flushDue = due;
+    flushTimer = setTimeout(runFlush, due - Date.now());
 }
 
 async function runFlush(): Promise<void> {
@@ -231,9 +239,10 @@ async function runFlush(): Promise<void> {
         console.error("[paper-stage] sync failed", err);
     } finally {
         flushing = false;
-        if (flushAgain) {
-            flushAgain = false;
-            scheduleFlush();
+        if (flushAgainAt !== null) {
+            const at = flushAgainAt;
+            flushAgainAt = null;
+            scheduleFlush(at - Date.now());
         }
     }
 }
@@ -252,6 +261,7 @@ async function flush(stage: Stage): Promise<void> {
         return rect ? [turnedBox(rect, element.rotation ?? 0)] : [];
     });
     let tooBig = 0;
+    let retryInMs = Infinity;
     for (const item of projection.items) {
         if (item.kind !== "cutout") {
             items.set(item.id, item);
@@ -259,10 +269,15 @@ async function flush(stage: Stage): Promise<void> {
         }
         let result = stage.cutouts.get(item.id, item.contentHash);
         if (!result) {
-            result = await captureCutout(host, item.rect, board);
+            const captured = await captureCutout(host, item.rect, board);
             // A capture that finishes after the writer changed belongs to an older epoch.
             if (stage.relay.writerEpoch !== epoch) return;
-            stage.cutouts.set(item.id, item.contentHash, result);
+            stage.cutouts.set(item.id, item.contentHash, captured);
+            result = stage.cutouts.get(item.id, item.contentHash)!;
+        }
+        if ("retryInMs" in result) {
+            retryInMs = Math.min(retryInMs, result.retryInMs);
+            continue;
         }
         if (!result.ok) {
             if (result.reason === "too_big") tooBig++;
@@ -274,6 +289,7 @@ async function flush(stage: Stage): Promise<void> {
     stage.cutouts.retain(new Set(projection.items.map((item) => item.id)));
     noteDropped(stage, { ...projection.dropped, tooBig });
     stage.relay.commit(epoch, { frame: projection.frame, items, assets });
+    if (retryInMs < Infinity) scheduleFlush(retryInMs);
 }
 
 function noteDropped(stage: Stage, dropped: Partial<Stage["dropped"]>): void {

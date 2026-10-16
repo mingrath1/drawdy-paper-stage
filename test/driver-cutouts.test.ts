@@ -185,10 +185,33 @@ describe("CutoutCache", () => {
         expect(cache.get("d", "v2")).toBeUndefined();
     });
 
-    it("remembers a failure so an unchanged drawing is not retried", () => {
+    it("keeps a too-big capture, which comes out the same until the drawing changes", () => {
         const cache = new CutoutCache();
         cache.set("d", "v1", { ok: false, reason: "too_big" });
         expect(cache.get("d", "v1")).toEqual({ ok: false, reason: "too_big" });
+    });
+
+    it("retries a failed capture after a backoff that grows and stays bounded", () => {
+        let now = 0;
+        const cache = new CutoutCache(() => now);
+        const waits: number[] = [];
+        for (let i = 0; i < 8; i++) {
+            cache.set("d", "v1", { ok: false, reason: "failed" });
+            const pending = cache.get("d", "v1");
+            if (!pending || !("retryInMs" in pending)) throw new Error(`expected a backoff, got ${JSON.stringify(pending)}`);
+            waits.push(pending.retryInMs);
+            now += pending.retryInMs - 1;
+            expect(cache.get("d", "v1")).toEqual({ retryInMs: 1 });
+            now += 1;
+            expect(cache.get("d", "v1")).toBeUndefined();
+        }
+        expect(waits).toEqual([1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000]);
+    });
+
+    it("captures a changed drawing at once, even while its old version backs off", () => {
+        const cache = new CutoutCache(() => 0);
+        cache.set("d", "v1", { ok: false, reason: "failed" });
+        expect(cache.get("d", "v2")).toBeUndefined();
     });
 
     it("forgets elements that left the stage", () => {
