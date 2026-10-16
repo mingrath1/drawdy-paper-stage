@@ -8,12 +8,10 @@ import {
   CLOSE,
   type ClientMessage,
   type ConnectionId,
-  CURSOR_HZ,
   type ErrorCode,
   parseClientMessage,
   type Participant,
   type Pose,
-  POSE_HZ,
   PROTOCOL_VERSION,
   ProtocolError,
   type ServerMessage,
@@ -28,6 +26,7 @@ import {
   sha256Hex,
   verifyUpload,
 } from "./assets.ts";
+import { Inbox, MAX_PENDING_FRAMES } from "./inbox.ts";
 import {
   applyPatch,
   checkpointEvery32,
@@ -50,9 +49,6 @@ import { KeyedSerialQueue } from "./serial.ts";
 export const STAGE_ID_HEADER = "x-paper-stage-id";
 
 const RECOVERY_ALARM_DELAY_MS = 60_000;
-const MESSAGES_PER_SECOND = 60;
-/** Lets a few poses that the network delivers together through without raising the sustained rate. */
-const EPHEMERAL_BURST = 5;
 
 const reportError = (
   message: string,
@@ -105,41 +101,15 @@ const CLOSE_CODES = {
   version: CLOSE.badVersion,
   bad_token: CLOSE.badToken,
   uninitialized: CLOSE.uninitialized,
+  limit: CLOSE.policy,
 } satisfies Partial<Record<ErrorCode, number>>;
+
+type ClosingError = keyof typeof CLOSE_CODES;
 
 export type AssetRead =
   | { readonly status: "found"; readonly png: Uint8Array }
   | { readonly status: "forbidden" }
   | { readonly status: "missing" };
-
-class TokenBucket {
-  readonly #perMs: number;
-  readonly #burst: number;
-  #tokens: number;
-  #at = 0;
-
-  constructor(perSecond: number, burst: number) {
-    this.#perMs = perSecond / 1000;
-    this.#burst = burst;
-    this.#tokens = burst;
-  }
-
-  take(now: number): boolean {
-    this.#tokens = Math.min(this.#burst, this.#tokens + (now - this.#at) * this.#perMs);
-    this.#at = now;
-    if (this.#tokens < 1) return false;
-    this.#tokens -= 1;
-    return true;
-  }
-}
-
-/** In memory only: hibernation means the socket was idle, so a fresh budget is correct after a wake. */
-type Budget = {
-  readonly messages: TokenBucket;
-  readonly poses: TokenBucket;
-  readonly cursors: TokenBucket;
-  lastWarning: number;
-};
 
 const isReservedCloseCode = (code: number): boolean =>
   code === 1005 || code === 1006 || code === 1015;
@@ -163,7 +133,7 @@ export class Stage extends DurableObject<Env> {
   #control!: ControlState;
   #receipts!: ReceiptsState;
   readonly #connections = new WeakMap<WebSocket, Connection>();
-  readonly #budgets = new WeakMap<WebSocket, Budget>();
+  readonly #inboxes = new WeakMap<WebSocket, Inbox>();
   readonly #departed = new WeakSet<WebSocket>();
   readonly #socketOperations = new KeyedSerialQueue<WebSocket>();
   /** Token claims, writer elections, commits, and uploads run one at a time, so each sees the last one's result. */
@@ -245,14 +215,14 @@ export class Stage extends DurableObject<Env> {
     await this.#refreshAlarm();
   }
 
-  override async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
+  override async webSocketMessage(socket: WebSocket, frame: string | ArrayBuffer): Promise<void> {
     try {
-      await this.#socketOperations.run(socket, () => this.#receive(socket, message));
+      await this.#arrive(socket, frame);
     } catch (error) {
       reportError("Stage message failed", error);
       try {
         socket.close(1011, "internal error");
-        await this.#socketOperations.run(socket, () => this.#depart(socket));
+        await this.#depart(socket);
       } catch (closeError) {
         reportError("Stage message failure cleanup failed", closeError);
       }
@@ -283,8 +253,14 @@ export class Stage extends DurableObject<Env> {
     }
   }
 
-  async #receive(socket: WebSocket, frame: string | ArrayBuffer): Promise<void> {
-    if (this.#departed.has(socket) || !this.#admit(socket)) return;
+  /**
+   * Parses a frame and spends its budget as it arrives, then queues it behind the socket's earlier frames. A writer
+   * request past the budget still gets an ack, in order, so the driver knows to retry it.
+   */
+  async #arrive(socket: WebSocket, frame: string | ArrayBuffer): Promise<void> {
+    if (this.#departed.has(socket)) return;
+    const now = Date.now();
+    const connection = this.#connection(socket);
     if (typeof frame !== "string") {
       return this.#disconnect(socket, "bad_message", "binary frames are not supported");
     }
@@ -294,11 +270,63 @@ export class Stage extends DurableObject<Env> {
     } catch (error) {
       if (!(error instanceof ProtocolError)) throw error;
       const code = Object.hasOwn(CLOSE_CODES, error.code)
-        ? (error.code as keyof typeof CLOSE_CODES)
+        ? (error.code as ClosingError)
         : "bad_message";
       return this.#disconnect(socket, code, error.message);
     }
 
+    const inbox = this.#inbox(socket);
+    if (inbox.full) {
+      return this.#disconnect(
+        socket,
+        "limit",
+        `more than ${MAX_PENDING_FRAMES} frames are waiting`,
+      );
+    }
+    const writer = this.#control.writer.connectionId === connection.connectionId;
+    const handle = inbox.admit(message.type, writer, now)
+      ? () => this.#handle(socket, message)
+      : this.#overBudget(socket, inbox, message, now);
+    if (handle !== undefined) await inbox.hold(() => this.#socketOperations.run(socket, handle));
+  }
+
+  /** How a frame past the budget is answered: poses and cursors drop silently. */
+  #overBudget(
+    socket: WebSocket,
+    inbox: Inbox,
+    message: ClientMessage,
+    now: number,
+  ): (() => void) | undefined {
+    switch (message.type) {
+      case "pose":
+      case "cursors":
+        return undefined;
+      case "scene.commit":
+      case "asset.put": {
+        const { requestId } = message;
+        return () =>
+          this.#send(socket, {
+            type: "ack",
+            requestId,
+            ok: false,
+            error: "limit",
+            message: "over the message budget; retry with backoff",
+          });
+      }
+      case "hello":
+      case "ping":
+        if (!inbox.warn(now)) return undefined;
+        return () =>
+          this.#send(socket, {
+            type: "error",
+            code: "limit",
+            message: "over the message budget; dropping",
+          });
+    }
+  }
+
+  async #handle(socket: WebSocket, message: ClientMessage): Promise<void> {
+    if (this.#departed.has(socket)) return;
     const connection = this.#connection(socket);
     if (message.type === "hello") {
       if (connection.member !== null) {
@@ -323,31 +351,6 @@ export class Stage extends DurableObject<Env> {
       case "ping":
         return this.#send(socket, { type: "pong", t: message.t });
     }
-  }
-
-  /** Spends one message from the socket's budget. Dropped frames get at most one `limit` error per second. */
-  #admit(socket: WebSocket): boolean {
-    let budget = this.#budgets.get(socket);
-    if (budget === undefined) {
-      budget = {
-        messages: new TokenBucket(MESSAGES_PER_SECOND, MESSAGES_PER_SECOND),
-        poses: new TokenBucket(POSE_HZ, EPHEMERAL_BURST),
-        cursors: new TokenBucket(CURSOR_HZ, EPHEMERAL_BURST),
-        lastWarning: -Infinity,
-      };
-      this.#budgets.set(socket, budget);
-    }
-    const now = Date.now();
-    if (budget.messages.take(now)) return true;
-    if (now - budget.lastWarning >= 1_000) {
-      budget.lastWarning = now;
-      this.#send(socket, {
-        type: "error",
-        code: "limit",
-        message: `more than ${MESSAGES_PER_SECOND} messages per second; dropping`,
-      });
-    }
-    return false;
   }
 
   async #hello(
@@ -534,7 +537,6 @@ export class Stage extends DurableObject<Env> {
         message: "only views send poses",
       });
     }
-    if (!this.#budgets.get(socket)!.poses.take(Date.now())) return;
     this.#setConnection(socket, { ...connection, member: { ...member, pose } });
     this.#broadcast(
       {
@@ -558,7 +560,6 @@ export class Stage extends DurableObject<Env> {
         message: "only the elected writer relays cursors",
       });
     }
-    if (!this.#budgets.get(socket)!.cursors.take(Date.now())) return;
     this.#broadcast(
       { type: "cursors", cursors: message.cursors },
       (member) => member.role === "view",
@@ -585,11 +586,7 @@ export class Stage extends DurableObject<Env> {
     }
   }
 
-  async #disconnect(
-    socket: WebSocket,
-    code: keyof typeof CLOSE_CODES,
-    message: string,
-  ): Promise<void> {
+  async #disconnect(socket: WebSocket, code: ClosingError, message: string): Promise<void> {
     this.#send(socket, { type: "error", code, message });
     try {
       socket.close(CLOSE_CODES[code], code);
@@ -616,6 +613,15 @@ export class Stage extends DurableObject<Env> {
   #setConnection(socket: WebSocket, connection: Connection): void {
     socket.serializeAttachment(connection);
     this.#connections.set(socket, connection);
+  }
+
+  #inbox(socket: WebSocket): Inbox {
+    let inbox = this.#inboxes.get(socket);
+    if (inbox === undefined) {
+      inbox = new Inbox();
+      this.#inboxes.set(socket, inbox);
+    }
+    return inbox;
   }
 
   /** Open sockets whose hello was accepted. */

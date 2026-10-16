@@ -10,6 +10,7 @@ import {
   type ServerMessage,
 } from "../../shared/protocol.ts";
 import {
+  type Client,
   commit,
   connect,
   cutout,
@@ -400,8 +401,6 @@ describe("assets", () => {
     writer.send(commit(epoch, "keep-oldest", { upserts: [cutout("kept", assets[0]!)] }));
     await writer.expect("ack");
     for (let index = 1; index <= capacity; index++) {
-      // Stay under the 60 messages per second budget.
-      await new Promise((resolve) => setTimeout(resolve, 20));
       writer.send(put(epoch, `p${index}`, assets[index]!));
       expect(await writer.expect("ack")).toMatchObject({ ok: true });
     }
@@ -426,7 +425,6 @@ describe("assets", () => {
       Array.from({ length: capacity + 1 }, (_, index) => png(8, 8, 5_000 + index)),
     );
     const upload = async (index: number) => {
-      await new Promise((resolve) => setTimeout(resolve, 20));
       writer.send(put(epoch, `p${index}-${Math.random()}`, assets[index]!));
       expect(await writer.expect("ack")).toMatchObject({ ok: true });
     };
@@ -545,17 +543,12 @@ describe("cursors", () => {
 describe("rate limit", () => {
   it("drops frames past 60 per second with a single limit error", async () => {
     const stageId = freshStage();
-    const { client } = await writerOf(stageId);
+    await writerOf(stageId);
+    const { client } = await join(stageId, "view");
     for (let index = 0; index < 100; index++) client.send({ type: "ping", t: index });
     client.send({ type: "ping", t: -1 });
 
-    const received: ServerMessage[] = [];
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    for (;;) {
-      const message = await client.next().catch(() => undefined);
-      if (message === undefined) break;
-      received.push(message);
-    }
+    const received = await drain(client);
     const errors = received.filter((message) => message.type === "error");
     const pongs = received.filter((message) => message.type === "pong");
     expect(errors).toEqual([expect.objectContaining({ code: "limit" })]);
@@ -565,4 +558,57 @@ describe("rate limit", () => {
     await new Promise((resolve) => setTimeout(resolve, 1_100));
     await client.expectQuiet();
   });
+
+  it("gives the writer 150 frames a second and answers its requests past that with limit acks", async () => {
+    const stageId = freshStage();
+    const { client: writer, epoch } = await writerOf(stageId);
+    const asset = await png(8, 8, 77);
+    for (let index = 0; index < 300; index++) writer.send({ type: "ping", t: index });
+    const sent = Array.from({ length: 20 }, (_, index) => `r${index}`);
+    for (const [index, requestId] of sent.entries()) {
+      writer.send(commit(epoch, requestId, { upserts: [wall(`w${index}`)] }));
+    }
+    writer.send(put(epoch, "upload", asset));
+
+    const received = await drain(writer);
+    const pongs = received.filter((message) => message.type === "pong");
+    expect(pongs.length).toBeGreaterThanOrEqual(148);
+    expect(pongs.length).toBeLessThan(300);
+    const acks = received.filter((message) => message.type === "ack");
+    expect(acks.map((ack) => ack.requestId)).toEqual([...sent, "upload"]);
+    const limited = acks.filter((ack) => !ack.ok);
+    expect(limited.length).toBeGreaterThan(0);
+    expect(limited).toEqual(limited.map(() => expect.objectContaining({ error: "limit" })));
+
+    writer.send(put(epoch, "upload-again", asset));
+    expect(await writer.expect("ack")).toMatchObject({ ok: true });
+  });
+
+  it("closes a malformed or oversized frame with its close code even past the budget", async () => {
+    const stageId = freshStage();
+    await writerOf(stageId);
+    const flood = async (frame: string) => {
+      const { client } = await join(stageId, "view");
+      for (let index = 0; index < 100; index++) client.send({ type: "ping", t: index });
+      client.send(frame);
+      return (await within(client.closed, 3_000))?.code;
+    };
+    expect(await flood("{not json")).toBe(CLOSE.malformed);
+    expect(
+      await flood(JSON.stringify({ type: "ping", t: 1, pad: "x".repeat(MAX_FRAME_CHARACTERS) })),
+    ).toBe(CLOSE.tooLarge);
+  });
 });
+
+/** Every frame the client receives until none arrives for 3 s. */
+async function drain(client: Client): Promise<ServerMessage[]> {
+  const received: ServerMessage[] = [];
+  for (;;) {
+    const message = await client.next().catch(() => undefined);
+    if (message === undefined) return received;
+    received.push(message);
+  }
+}
+
+const within = <T>(promise: Promise<T>, ms: number): Promise<T | undefined> =>
+  Promise.race([promise, new Promise<undefined>((resolve) => setTimeout(resolve, ms))]);

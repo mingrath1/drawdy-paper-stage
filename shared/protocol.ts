@@ -172,6 +172,8 @@ export const CLOSE = {
     uninitialized: 4409,
     malformed: 1002,
     tooLarge: 1009,
+    /** More frames waiting than the Stage keeps for one socket. */
+    policy: 1008,
 } as const;
 
 /** Views fetch cutout PNGs over HTTPS: GET {backendUrl}/api/stages/{stageId}/assets/{hash}?token={token}. */
