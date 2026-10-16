@@ -8,12 +8,10 @@ import {
   CLOSE,
   type ClientMessage,
   type ConnectionId,
-  CURSOR_HZ,
   type ErrorCode,
   parseClientMessage,
   type Participant,
   type Pose,
-  POSE_HZ,
   PROTOCOL_VERSION,
   ProtocolError,
   type ServerMessage,
@@ -28,12 +26,19 @@ import {
   sha256Hex,
   verifyUpload,
 } from "./assets.ts";
+import { Inbox, MAX_PENDING_FRAMES } from "./inbox.ts";
 import {
   applyPatch,
+  checkpointEvery32,
+  type CommitReceipt,
+  commitPayload,
   CommitReceipts,
+  findReceipt,
   planCommit,
+  type ReceiptsState,
   referencedAssets,
   type Refusal,
+  remember,
   SceneDoc,
   type SceneState,
   sceneSnapshot,
@@ -44,9 +49,13 @@ import { KeyedSerialQueue } from "./serial.ts";
 export const STAGE_ID_HEADER = "x-paper-stage-id";
 
 const RECOVERY_ALARM_DELAY_MS = 60_000;
-const MESSAGES_PER_SECOND = 60;
-/** Lets a few poses that the network delivers together through without raising the sustained rate. */
-const EPHEMERAL_BURST = 5;
+/** The alarm sweep closes a socket that has not said hello by then. */
+const HELLO_TIMEOUT_MS = 10_000;
+/** Drivers ping every 10 s, so a writer silent this long is asleep or gone and loses its seat. */
+const WRITER_TIMEOUT_MS = 30_000;
+/** Also bounds the walkers a welcome lists, which keeps a welcome far under MAX_FRAME_CHARACTERS. */
+const MAX_SOCKETS_PER_STAGE = 64;
+const MAX_SOCKETS_PER_PRESENCE = 8;
 
 const reportError = (
   message: string,
@@ -74,10 +83,11 @@ const ControlDoc = defineDoc<ControlState>({
   version: 1,
   scope: "session",
   initial: () => ({ tokenHash: null, writer: { connectionId: null, epoch: 0 }, assets: {} }),
+  checkpointWhen: checkpointEvery32,
 });
 
 type Member =
-  | { readonly role: "driver"; readonly participant: Participant }
+  | { readonly role: "driver"; readonly participant: Participant; readonly lastSeenAt: number }
   | { readonly role: "view"; readonly participant: Participant; readonly pose: Pose | null };
 
 /** Kept in the WebSocket attachment, so it survives hibernation. */
@@ -90,49 +100,25 @@ type Connection = {
 };
 
 type Joined = Connection & { readonly member: Member };
+type Driver = Connection & { readonly member: Extract<Member, { role: "driver" }> };
 
-/** Errors that end the connection, and the close code each uses. */
+/** Errors that end the connection, and the close code each uses unless the caller names another. */
 const CLOSE_CODES = {
   bad_message: CLOSE.malformed,
   too_large: CLOSE.tooLarge,
   version: CLOSE.badVersion,
   bad_token: CLOSE.badToken,
   uninitialized: CLOSE.uninitialized,
+  limit: CLOSE.policy,
 } satisfies Partial<Record<ErrorCode, number>>;
+
+type ClosingError = keyof typeof CLOSE_CODES;
+type HelloRefusal = { code: ClosingError; message: string; closeCode?: number };
 
 export type AssetRead =
   | { readonly status: "found"; readonly png: Uint8Array }
   | { readonly status: "forbidden" }
   | { readonly status: "missing" };
-
-class TokenBucket {
-  readonly #perMs: number;
-  readonly #burst: number;
-  #tokens: number;
-  #at = 0;
-
-  constructor(perSecond: number, burst: number) {
-    this.#perMs = perSecond / 1000;
-    this.#burst = burst;
-    this.#tokens = burst;
-  }
-
-  take(now: number): boolean {
-    this.#tokens = Math.min(this.#burst, this.#tokens + (now - this.#at) * this.#perMs);
-    this.#at = now;
-    if (this.#tokens < 1) return false;
-    this.#tokens -= 1;
-    return true;
-  }
-}
-
-/** In memory only: hibernation means the socket was idle, so a fresh budget is correct after a wake. */
-type Budget = {
-  readonly messages: TokenBucket;
-  readonly poses: TokenBucket;
-  readonly cursors: TokenBucket;
-  lastWarning: number;
-};
 
 const isReservedCloseCode = (code: number): boolean =>
   code === 1005 || code === 1006 || code === 1015;
@@ -149,13 +135,19 @@ const reciprocateClose = (socket: WebSocket, code: number, reason: string): void
 const byJoinOrder = (left: Connection, right: Connection): number =>
   left.connectedAt - right.connectedAt || left.connectionId.localeCompare(right.connectionId);
 
+const isLiveDriver =
+  (now: number) =>
+  (connection: Joined): connection is Driver =>
+    connection.member.role === "driver" && now - connection.member.lastSeenAt < WRITER_TIMEOUT_MS;
+
 export class Stage extends DurableObject<Env> {
   #harness!: Harness;
-  /** In-memory copies of the two documents. Only `#stageOperations` changes them, right after each commit. */
+  /** In-memory copies of the documents. Only `#stageOperations` changes them, right after each commit. */
   #scene!: SceneState;
   #control!: ControlState;
+  #receipts!: ReceiptsState;
   readonly #connections = new WeakMap<WebSocket, Connection>();
-  readonly #budgets = new WeakMap<WebSocket, Budget>();
+  readonly #inboxes = new WeakMap<WebSocket, Inbox>();
   readonly #departed = new WeakSet<WebSocket>();
   readonly #socketOperations = new KeyedSerialQueue<WebSocket>();
   /** Token claims, writer elections, commits, and uploads run one at a time, so each sees the last one's result. */
@@ -195,6 +187,10 @@ export class Stage extends DurableObject<Env> {
       this.#control = structuredClone(
         (await harness.snapshot(ControlDoc, BACKGROUND_CONTEXT)) ?? ControlDoc.definition.initial(),
       );
+      this.#receipts = structuredClone(
+        (await harness.snapshot(CommitReceipts, BACKGROUND_CONTEXT)) ??
+          CommitReceipts.definition.initial(),
+      );
       // A deploy drops every socket, so the stored writer may be gone.
       await this.#electWriter();
       await this.#refreshAlarm();
@@ -208,13 +204,20 @@ export class Stage extends DurableObject<Env> {
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
+    if (this.#openSockets().length >= MAX_SOCKETS_PER_STAGE) {
+      server.accept();
+      server.close(CLOSE.full, "the stage is full");
+      return new Response(null, { status: 101, webSocket: client });
+    }
     this.ctx.acceptWebSocket(server);
+    const connectedAt = Date.now();
     this.#setConnection(server, {
       connectionId: crypto.randomUUID(),
       stageId: request.headers.get(STAGE_ID_HEADER) ?? "",
-      connectedAt: Date.now(),
+      connectedAt,
       member: null,
     });
+    await this.#alarmBy(connectedAt + HELLO_TIMEOUT_MS);
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -230,17 +233,37 @@ export class Stage extends DurableObject<Env> {
   }
 
   override async alarm(): Promise<void> {
+    await this.#sweep();
     await this.#refreshAlarm();
   }
 
-  override async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
+  /** Closes sockets that never said hello and re-runs the election, so a silent writer loses its seat. */
+  async #sweep(): Promise<void> {
+    const now = Date.now();
+    const late = this.#openSockets().filter((socket) => {
+      const { member, connectedAt } = this.#connection(socket);
+      return member === null && now - connectedAt >= HELLO_TIMEOUT_MS;
+    });
+    // Each check waits behind the socket's own frames, so a hello that already arrived still gets its answer.
+    await Promise.all(
+      late.map((socket) =>
+        this.#socketOperations.run(socket, async () => {
+          if (this.#departed.has(socket) || this.#connection(socket).member !== null) return;
+          await this.#disconnect(socket, "bad_message", "no hello within 10 s", CLOSE.policy);
+        }),
+      ),
+    );
+    await this.#stageOperations.run("stage", () => this.#electWriter());
+  }
+
+  override async webSocketMessage(socket: WebSocket, frame: string | ArrayBuffer): Promise<void> {
     try {
-      await this.#socketOperations.run(socket, () => this.#receive(socket, message));
+      await this.#arrive(socket, frame);
     } catch (error) {
       reportError("Stage message failed", error);
       try {
         socket.close(1011, "internal error");
-        await this.#socketOperations.run(socket, () => this.#depart(socket));
+        await this.#depart(socket);
       } catch (closeError) {
         reportError("Stage message failure cleanup failed", closeError);
       }
@@ -271,8 +294,20 @@ export class Stage extends DurableObject<Env> {
     }
   }
 
-  async #receive(socket: WebSocket, frame: string | ArrayBuffer): Promise<void> {
-    if (this.#departed.has(socket) || !this.#admit(socket)) return;
+  /**
+   * Parses a frame and spends its budget as it arrives, then queues it behind the socket's earlier frames. A writer
+   * request past the budget still gets an ack, in order, so the driver knows to retry it.
+   */
+  async #arrive(socket: WebSocket, frame: string | ArrayBuffer): Promise<void> {
+    if (this.#departed.has(socket)) return;
+    const now = Date.now();
+    const connection = this.#connection(socket);
+    if (connection.member?.role === "driver") {
+      this.#setConnection(socket, {
+        ...connection,
+        member: { ...connection.member, lastSeenAt: now },
+      });
+    }
     if (typeof frame !== "string") {
       return this.#disconnect(socket, "bad_message", "binary frames are not supported");
     }
@@ -282,11 +317,63 @@ export class Stage extends DurableObject<Env> {
     } catch (error) {
       if (!(error instanceof ProtocolError)) throw error;
       const code = Object.hasOwn(CLOSE_CODES, error.code)
-        ? (error.code as keyof typeof CLOSE_CODES)
+        ? (error.code as ClosingError)
         : "bad_message";
       return this.#disconnect(socket, code, error.message);
     }
 
+    const inbox = this.#inbox(socket);
+    if (inbox.full) {
+      return this.#disconnect(
+        socket,
+        "limit",
+        `more than ${MAX_PENDING_FRAMES} frames are waiting`,
+      );
+    }
+    const writer = this.#control.writer.connectionId === connection.connectionId;
+    const handle = inbox.admit(message.type, writer, now)
+      ? () => this.#handle(socket, message)
+      : this.#overBudget(socket, inbox, message, now);
+    if (handle !== undefined) await inbox.hold(() => this.#socketOperations.run(socket, handle));
+  }
+
+  /** How a frame past the budget is answered: poses and cursors drop silently. */
+  #overBudget(
+    socket: WebSocket,
+    inbox: Inbox,
+    message: ClientMessage,
+    now: number,
+  ): (() => void) | undefined {
+    switch (message.type) {
+      case "pose":
+      case "cursors":
+        return undefined;
+      case "scene.commit":
+      case "asset.put": {
+        const { requestId } = message;
+        return () =>
+          this.#send(socket, {
+            type: "ack",
+            requestId,
+            ok: false,
+            error: "limit",
+            message: "over the message budget; retry with backoff",
+          });
+      }
+      case "hello":
+      case "ping":
+        if (!inbox.warn(now)) return undefined;
+        return () =>
+          this.#send(socket, {
+            type: "error",
+            code: "limit",
+            message: "over the message budget; dropping",
+          });
+    }
+  }
+
+  async #handle(socket: WebSocket, message: ClientMessage): Promise<void> {
+    if (this.#departed.has(socket)) return;
     const connection = this.#connection(socket);
     if (message.type === "hello") {
       if (connection.member !== null) {
@@ -298,6 +385,10 @@ export class Stage extends DurableObject<Env> {
       return this.#disconnect(socket, "bad_message", "send hello first");
     }
     const joined = connection as Joined;
+    if (joined.member.role === "driver" && this.#control.writer.connectionId === null) {
+      // The seat empties when every driver went silent, so the first one heard from again takes it.
+      await this.#stageOperations.run("stage", () => this.#electWriter());
+    }
 
     switch (message.type) {
       case "scene.commit":
@@ -313,31 +404,6 @@ export class Stage extends DurableObject<Env> {
     }
   }
 
-  /** Spends one message from the socket's budget. Dropped frames get at most one `limit` error per second. */
-  #admit(socket: WebSocket): boolean {
-    let budget = this.#budgets.get(socket);
-    if (budget === undefined) {
-      budget = {
-        messages: new TokenBucket(MESSAGES_PER_SECOND, MESSAGES_PER_SECOND),
-        poses: new TokenBucket(POSE_HZ, EPHEMERAL_BURST),
-        cursors: new TokenBucket(CURSOR_HZ, EPHEMERAL_BURST),
-        lastWarning: -Infinity,
-      };
-      this.#budgets.set(socket, budget);
-    }
-    const now = Date.now();
-    if (budget.messages.take(now)) return true;
-    if (now - budget.lastWarning >= 1_000) {
-      budget.lastWarning = now;
-      this.#send(socket, {
-        type: "error",
-        code: "limit",
-        message: `more than ${MESSAGES_PER_SECOND} messages per second; dropping`,
-      });
-    }
-    return false;
-  }
-
   async #hello(
     socket: WebSocket,
     connection: Connection,
@@ -349,23 +415,46 @@ export class Stage extends DurableObject<Env> {
       return this.#disconnect(socket, "bad_message", "hello.stageId does not match the URL");
     }
     const tokenHash = await sha256Hex(hello.token);
-    const verdict = await this.#stageOperations.run("stage", () =>
-      this.#admitToken(hello.role, tokenHash),
+    const refusal = await this.#stageOperations.run("stage", () =>
+      this.#join(socket, hello, tokenHash),
     );
-    if (verdict !== "ok") {
-      console.log(`${log} ${verdict}`);
-      const message =
-        verdict === "uninitialized"
-          ? "no driver has opened this stage yet; retry"
-          : "the token does not match this stage";
-      return this.#disconnect(socket, verdict, message);
+    console.log(`${log} ${refusal?.code ?? "ok"}`);
+    if (refusal !== undefined) {
+      return this.#disconnect(socket, refusal.code, refusal.message, refusal.closeCode);
     }
-    if (socket.readyState !== WebSocket.READY_STATE_OPEN) return;
+  }
+
+  /** The token check, the per-person cap, joining, the welcome, and the election, with no stage change between them. */
+  async #join(
+    socket: WebSocket,
+    hello: Extract<ClientMessage, { type: "hello" }>,
+    tokenHash: string,
+  ): Promise<HelloRefusal | undefined> {
+    if (socket.readyState !== WebSocket.READY_STATE_OPEN || this.#departed.has(socket)) return;
+    const verdict = await this.#admitToken(hello.role, tokenHash);
+    if (verdict === "uninitialized") {
+      return { code: verdict, message: "no driver has opened this stage yet; retry" };
+    }
+    if (verdict === "bad_token") {
+      return { code: verdict, message: "the token does not match this stage" };
+    }
+    const { presenceId } = hello.participant;
+    const sockets = this.#members().filter(
+      ([, { member }]) => member.participant.presenceId === presenceId,
+    );
+    if (sockets.length >= MAX_SOCKETS_PER_PRESENCE) {
+      return {
+        code: "limit",
+        message: `one person holds at most ${MAX_SOCKETS_PER_PRESENCE} sockets on a stage`,
+        closeCode: CLOSE.full,
+      };
+    }
 
     const member: Member =
       hello.role === "driver"
-        ? { role: "driver", participant: hello.participant }
+        ? { role: "driver", participant: hello.participant, lastSeenAt: Date.now() }
         : { role: "view", participant: hello.participant, pose: null };
+    const connection = this.#connection(socket);
     this.#setConnection(socket, { ...connection, member });
     // Joining and the welcome happen in one synchronous step, so every later patch reaches this socket after it.
     this.#send(socket, {
@@ -376,10 +465,8 @@ export class Stage extends DurableObject<Env> {
       snapshot: sceneSnapshot(this.#scene),
       walkers: this.#walkers(socket),
     });
-    console.log(`${log} ok`);
-    if (member.role === "driver") {
-      await this.#stageOperations.run("stage", () => this.#electWriter());
-    }
+    if (member.role === "driver") await this.#electWriter();
+    return undefined;
   }
 
   async #admitToken(
@@ -395,21 +482,25 @@ export class Stage extends DurableObject<Env> {
     return "ok";
   }
 
-  /** Keeps the writer while its socket is joined, else hands the role to the longest-connected driver. */
+  /**
+   * Keeps the writer while it is joined and heard from in the last WRITER_TIMEOUT_MS, else hands the role to the
+   * longest-connected driver that is, or to nobody. Runs only inside a stage operation.
+   */
   async #electWriter(): Promise<void> {
     const current = this.#control.writer;
     const drivers = this.#members()
       .map(([, connection]) => connection)
-      .filter((connection) => connection.member.role === "driver");
+      .filter(isLiveDriver(Date.now()));
     if (drivers.some((driver) => driver.connectionId === current.connectionId)) return;
-    const next = drivers.sort(byJoinOrder)[0]?.connectionId ?? null;
-    if (next === null && current.connectionId === null) return;
+    const next = drivers.sort(byJoinOrder)[0];
+    if (next === undefined && current.connectionId === null) return;
 
-    const writer: Writer = { connectionId: next, epoch: current.epoch + 1 };
+    const writer: Writer = { connectionId: next?.connectionId ?? null, epoch: current.epoch + 1 };
     await this.#updateControl((control) => {
       control.writer = writer;
     });
     this.#broadcast({ type: "writer", writer });
+    if (next !== undefined) await this.#alarmBy(next.member.lastSeenAt + WRITER_TIMEOUT_MS);
   }
 
   async #commit(
@@ -417,24 +508,46 @@ export class Stage extends DurableObject<Env> {
     connection: Joined,
     commit: Extract<ClientMessage, { type: "scene.commit" }>,
   ): Promise<void> {
-    const { requestId } = commit;
-    const receipt = await this.#harness.snapshot(CommitReceipts, requestId, BACKGROUND_CONTEXT);
-    if (receipt?.revision !== undefined) {
-      return this.#send(socket, { type: "ack", requestId, ok: true, revision: receipt.revision });
+    const { requestId, epoch } = commit;
+    const writerRefusal = this.#writerRefusal(connection, epoch);
+    if (writerRefusal !== undefined) {
+      this.#send(socket, { type: "ack", requestId, ...writerRefusal });
+      return this.#electWriter();
     }
-    const plan =
-      this.#writerRefusal(connection, commit.epoch) ??
-      planCommit(this.#scene, this.#control.assets, commit);
+    const digest = await sha256Hex(commitPayload(commit));
+    const receipt = findReceipt(this.#receipts, epoch, requestId);
+    if (receipt !== undefined) {
+      return this.#send(
+        socket,
+        receipt.digest === digest
+          ? { type: "ack", requestId, ok: true, revision: receipt.revision }
+          : {
+              type: "ack",
+              requestId,
+              ok: false,
+              error: "bad_message",
+              message: "this requestId already named a different commit",
+            },
+      );
+    }
+    const plan = planCommit(this.#scene, this.#control.assets, commit);
     if (!plan.ok) return this.#send(socket, { type: "ack", requestId, ...plan });
 
     const { patch } = plan;
+    const accepted: CommitReceipt = {
+      epoch,
+      requestId,
+      digest,
+      revision: patch?.revision ?? this.#scene.revision,
+    };
     await this.#harness.commit(async (tx) => {
-      applyPatch(await tx.doc(SceneDoc), patch);
-      (await tx.doc(CommitReceipts, requestId, null)).revision = patch.revision;
+      if (patch !== undefined) applyPatch(await tx.doc(SceneDoc), patch);
+      remember(await tx.doc(CommitReceipts), accepted);
     }, BACKGROUND_CONTEXT);
-    applyPatch(this.#scene, patch);
-    this.#send(socket, { type: "ack", requestId, ok: true, revision: patch.revision });
-    this.#broadcast({ type: "scene.patch", ...patch }, () => true, socket);
+    if (patch !== undefined) applyPatch(this.#scene, patch);
+    remember(this.#receipts, accepted);
+    this.#send(socket, { type: "ack", requestId, ok: true, revision: accepted.revision });
+    if (patch !== undefined) this.#broadcast({ type: "scene.patch", ...patch }, () => true, socket);
   }
 
   async #putAsset(
@@ -446,9 +559,20 @@ export class Stage extends DurableObject<Env> {
     const accepted = { type: "ack", requestId, ok: true, revision: this.#scene.revision } as const;
     const writerRefusal = this.#writerRefusal(connection, put.epoch);
     if (writerRefusal !== undefined) {
-      return this.#send(socket, { type: "ack", requestId, ...writerRefusal });
+      this.#send(socket, { type: "ack", requestId, ...writerRefusal });
+      return this.#electWriter();
     }
-    if (Object.hasOwn(this.#control.assets, hash)) return this.#send(socket, accepted);
+    const stored = Object.hasOwn(this.#control.assets, hash)
+      ? this.#control.assets[hash]
+      : undefined;
+    if (stored !== undefined) {
+      // A repeat upload comes right before a commit that uses the asset, so it moves to the newest place.
+      await this.#updateControl((control) => {
+        delete control.assets[hash];
+        control.assets[hash] = { ...stored, storedAt: Date.now() };
+      });
+      return this.#send(socket, accepted);
+    }
     const invalid = await verifyUpload(put);
     if (invalid !== undefined) return this.#send(socket, { type: "ack", requestId, ...invalid });
     const evictions = evictionsFor(this.#control.assets, referencedAssets(this.#scene));
@@ -491,7 +615,6 @@ export class Stage extends DurableObject<Env> {
         message: "only views send poses",
       });
     }
-    if (!this.#budgets.get(socket)!.poses.take(Date.now())) return;
     this.#setConnection(socket, { ...connection, member: { ...member, pose } });
     this.#broadcast(
       {
@@ -515,7 +638,6 @@ export class Stage extends DurableObject<Env> {
         message: "only the elected writer relays cursors",
       });
     }
-    if (!this.#budgets.get(socket)!.cursors.take(Date.now())) return;
     this.#broadcast(
       { type: "cursors", cursors: message.cursors },
       (member) => member.role === "view",
@@ -544,12 +666,13 @@ export class Stage extends DurableObject<Env> {
 
   async #disconnect(
     socket: WebSocket,
-    code: keyof typeof CLOSE_CODES,
+    code: ClosingError,
     message: string,
+    closeCode: number = CLOSE_CODES[code],
   ): Promise<void> {
     this.#send(socket, { type: "error", code, message });
     try {
-      socket.close(CLOSE_CODES[code], code);
+      socket.close(closeCode, code);
     } catch {
       // The peer may have closed first.
     }
@@ -575,11 +698,27 @@ export class Stage extends DurableObject<Env> {
     this.#connections.set(socket, connection);
   }
 
+  #inbox(socket: WebSocket): Inbox {
+    let inbox = this.#inboxes.get(socket);
+    if (inbox === undefined) {
+      inbox = new Inbox();
+      this.#inboxes.set(socket, inbox);
+    }
+    return inbox;
+  }
+
+  #openSockets(): WebSocket[] {
+    return this.ctx
+      .getWebSockets()
+      .filter(
+        (socket) => socket.readyState === WebSocket.READY_STATE_OPEN && !this.#departed.has(socket),
+      );
+  }
+
   /** Open sockets whose hello was accepted. */
   #members(): Array<[WebSocket, Joined]> {
     const members: Array<[WebSocket, Joined]> = [];
-    for (const socket of this.ctx.getWebSockets()) {
-      if (socket.readyState !== WebSocket.READY_STATE_OPEN || this.#departed.has(socket)) continue;
+    for (const socket of this.#openSockets()) {
       const connection = this.#connection(socket);
       if (connection.member !== null) members.push([socket, connection as Joined]);
     }
@@ -620,11 +759,34 @@ export class Stage extends DurableObject<Env> {
       const resumable = tasks
         .filter((task) => task.state.kind !== "blocked")
         .map((task) => task.record.id);
-      await this.#replaceAlarm(
-        resumable.length === 0 ? undefined : Date.now() + RECOVERY_ALARM_DELAY_MS,
-      );
+      const due = [
+        ...(resumable.length === 0 ? [] : [Date.now() + RECOVERY_ALARM_DELAY_MS]),
+        ...this.#sweepDeadlines(),
+      ];
+      await this.#replaceAlarm(due.length === 0 ? undefined : Math.min(...due));
       // waitForTask starts the scheduler, so persist its recovery alarm first.
       for (const taskId of resumable) this.#refreshAlarmWhenTaskSettles(taskId);
+    });
+  }
+
+  /** When the sweep has work: a hello deadline, or the moment the writer's silence would cost it the seat. */
+  #sweepDeadlines(): number[] {
+    const writer = this.#control.writer.connectionId;
+    return this.#openSockets().flatMap((socket) => {
+      const { connectionId, connectedAt, member } = this.#connection(socket);
+      if (member === null) return [connectedAt + HELLO_TIMEOUT_MS];
+      if (member.role === "driver" && connectionId === writer) {
+        return [member.lastSeenAt + WRITER_TIMEOUT_MS];
+      }
+      return [];
+    });
+  }
+
+  /** Moves the alarm earlier when `deadline` comes before it. */
+  #alarmBy(deadline: number): Promise<void> {
+    return this.#serializeAlarmUpdate(async () => {
+      const current = await this.ctx.storage.getAlarm();
+      if (current === null || current > deadline) await this.ctx.storage.setAlarm(deadline);
     });
   }
 

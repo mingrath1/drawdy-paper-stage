@@ -7,159 +7,24 @@ import {
   MAX_FRAME_CHARACTERS,
   MAX_ITEMS_PER_COMMIT,
   MAX_ITEMS_PER_STAGE,
-  parseServerMessage,
-  type Pose,
-  type Role,
   type ServerMessage,
-  type StageItem,
 } from "../../shared/protocol.ts";
-
-const TOKEN = "stage-token";
-let stageCounter = 0;
-const freshStage = () => `stage-${Date.now()}-${stageCounter++}`;
-
-type Message<T extends ServerMessage["type"]> = Extract<ServerMessage, { type: T }>;
-
-class Client {
-  readonly socket: WebSocket;
-  readonly closed: Promise<{ code: number; reason: string }>;
-  readonly #inbox: ServerMessage[] = [];
-  #wake: (() => void) | undefined;
-
-  constructor(socket: WebSocket) {
-    this.socket = socket;
-    socket.accept();
-    socket.addEventListener("message", (event) => {
-      // Every frame the Stage sends must satisfy the shared protocol.
-      this.#inbox.push(parseServerMessage(event.data as string));
-      this.#wake?.();
-    });
-    this.closed = new Promise((resolve) =>
-      socket.addEventListener("close", (event) => {
-        resolve({ code: event.code, reason: event.reason });
-        this.#wake?.();
-      }),
-    );
-  }
-
-  send(message: unknown): void {
-    this.socket.send(typeof message === "string" ? message : JSON.stringify(message));
-  }
-
-  async next(): Promise<ServerMessage> {
-    const deadline = Date.now() + 3_000;
-    while (this.#inbox.length === 0) {
-      if (Date.now() > deadline) throw new Error("no message within 3 s");
-      await new Promise<void>((resolve) => {
-        this.#wake = resolve;
-        setTimeout(resolve, 50);
-      });
-    }
-    return this.#inbox.shift()!;
-  }
-
-  async expect<T extends ServerMessage["type"]>(type: T): Promise<Message<T>> {
-    const message = await this.next();
-    expect(message.type).toBe(type);
-    return message as Message<T>;
-  }
-
-  /** Proves nothing else is queued: the next frame after a ping must be its pong. */
-  async expectQuiet(): Promise<void> {
-    const t = Math.random();
-    this.send({ type: "ping", t });
-    expect(await this.next()).toEqual({ type: "pong", t });
-  }
-
-  close(): void {
-    this.socket.close(1000, "done");
-  }
-}
-
-async function connect(stageId: string): Promise<Client> {
-  const response = await exports.default.fetch(`https://example.com/api/stages/${stageId}`, {
-    headers: { Upgrade: "websocket" },
-  });
-  expect(response.status).toBe(101);
-  return new Client(response.webSocket!);
-}
-
-const participant = (name: string) => ({ presenceId: `presence-${name}`, name, color: "#ff7a00" });
-
-const hello = (stageId: string, role: Role, token = TOKEN, name: string = role) => ({
-  type: "hello",
-  v: 2,
-  stageId,
-  token,
-  role,
-  participant: participant(name),
-});
-
-async function join(stageId: string, role: Role, name: string = role) {
-  const client = await connect(stageId);
-  client.send(hello(stageId, role, TOKEN, name));
-  const welcome = await client.expect("welcome");
-  return { client, welcome };
-}
-
-/** The first driver of a fresh stage, after its election. */
-async function writerOf(stageId: string) {
-  const { client, welcome } = await join(stageId, "driver");
-  const { writer } = await client.expect("writer");
-  expect(writer.connectionId).toBe(welcome.connectionId);
-  return { client, epoch: writer.epoch, connectionId: welcome.connectionId };
-}
-
-const wall = (id: string, x = 0): StageItem => ({
-  kind: "wall",
-  id,
-  rect: { x, y: 0, width: 300, height: 10 },
-  shape: "rect",
-  rotation: 0,
-});
-
-const commit = (epoch: number, requestId: string, fields: Record<string, unknown>) => ({
-  type: "scene.commit",
-  requestId,
-  epoch,
-  upserts: [],
-  removes: [],
-  ...fields,
-});
-
-const toBase64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
-
-/** Bytes with a PNG signature and IHDR, which is all the Stage reads. */
-async function png(width: number, height: number, salt: number) {
-  const bytes = new Uint8Array(37);
-  bytes.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]);
-  const view = new DataView(bytes.buffer);
-  view.setUint32(16, width);
-  view.setUint32(20, height);
-  view.setUint32(33, salt);
-  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
-  const hash = Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
-  return { bytes, hash, width, height, pngBase64: toBase64(bytes) };
-}
-
-const put = (epoch: number, requestId: string, asset: Awaited<ReturnType<typeof png>>) => ({
-  type: "asset.put",
-  requestId,
-  epoch,
-  hash: asset.hash,
-  width: asset.width,
-  height: asset.height,
-  pngBase64: asset.pngBase64,
-});
-
-const cutout = (id: string, asset: { hash: string; width: number; height: number }): StageItem => ({
-  kind: "cutout",
-  id,
-  rect: { x: 10, y: 10, width: 40, height: 40 },
-  asset: { hash: asset.hash, width: asset.width, height: asset.height },
-});
-
-const pose = (x: number): Pose => ({ x, y: 2, heading: 0.5, pitch: 0.1 });
+import {
+  type Client,
+  commit,
+  connect,
+  cutout,
+  freshStage,
+  hello,
+  join,
+  participant,
+  png,
+  pose,
+  put,
+  TOKEN,
+  wall,
+  writerOf,
+} from "./stage-client.ts";
 
 describe("Worker routes", () => {
   it("answers health checks from any origin", async () => {
@@ -337,6 +202,30 @@ describe("scene", () => {
     expect(await writer.expect("ack")).toMatchObject({ ok: true });
   });
 
+  it("keeps the stored deltas of every stage document bounded across many commits", async () => {
+    const stageId = freshStage();
+    const { client: writer, epoch } = await writerOf(stageId);
+    for (let index = 0; index < 50; index++) {
+      writer.send(commit(epoch, `move-${index}`, { upserts: [wall("a", index)] }));
+      expect(await writer.expect("ack")).toMatchObject({ ok: true, revision: index + 1 });
+    }
+
+    const revisions = await runInDurableObject(env.STAGES.getByName(stageId), (_instance, state) =>
+      state.storage.sql
+        .exec<{ doc: string; rows: number }>(
+          `SELECT json_extract(d.kind, '$') AS doc, COUNT(*) AS rows FROM document_revisions r
+            JOIN documents d ON d.id = r.document_id GROUP BY d.id HAVING doc LIKE 'app.stage%'`,
+        )
+        .toArray(),
+    );
+    expect(revisions.map(({ doc }) => doc)).toContain("app.stage");
+    expect(revisions.filter(({ rows }) => rows > 33)).toEqual([]);
+
+    await evictDurableObject(env.STAGES.getByName(stageId));
+    const { welcome } = await join(stageId, "view");
+    expect(welcome.snapshot).toMatchObject({ revision: 50, items: [wall("a", 49)] });
+  });
+
   it("survives eviction of the Durable Object", async () => {
     const stageId = freshStage();
     const { client: writer, epoch } = await writerOf(stageId);
@@ -356,6 +245,65 @@ describe("scene", () => {
       `https://example.com/api/stages/${stageId}/assets/${asset.hash}?token=${TOKEN}`,
     );
     expect(new Uint8Array(await image.arrayBuffer())).toEqual(asset.bytes);
+  });
+});
+
+describe("commit receipts", () => {
+  it("fences a reused requestId by writer and epoch before answering from a receipt", async () => {
+    const stageId = freshStage();
+    const first = await writerOf(stageId);
+    first.client.send(commit(first.epoch, "r1", { upserts: [wall("a")] }));
+    expect(await first.client.expect("ack")).toMatchObject({ ok: true, revision: 1 });
+    first.client.send(commit(first.epoch - 1, "r1", { upserts: [wall("a")] }));
+    expect(await first.client.expect("ack")).toMatchObject({ ok: false, error: "stale_epoch" });
+
+    const second = await join(stageId, "driver", "second");
+    second.client.send(commit(first.epoch, "r1", { upserts: [wall("a")] }));
+    expect(await second.client.expect("ack")).toMatchObject({ ok: false, error: "not_writer" });
+
+    first.client.close();
+    const { writer } = await second.client.expect("writer");
+    second.client.send(commit(writer.epoch, "r1", { upserts: [wall("b")] }));
+    expect(await second.client.expect("ack")).toMatchObject({ ok: true, revision: 2 });
+    const { welcome } = await join(stageId, "view");
+    expect(welcome.snapshot.items).toEqual([wall("a"), wall("b")]);
+  });
+
+  it("refuses a requestId reused for a different commit and applies nothing", async () => {
+    const stageId = freshStage();
+    const { client: writer, epoch } = await writerOf(stageId);
+    const { client: view } = await join(stageId, "view");
+    writer.send(commit(epoch, "r1", { upserts: [wall("a")] }));
+    expect(await writer.expect("ack")).toMatchObject({ ok: true, revision: 1 });
+    await view.expect("scene.patch");
+
+    writer.send(commit(epoch, "r1", { upserts: [wall("b")] }));
+    expect(await writer.expect("ack")).toMatchObject({ ok: false, error: "bad_message" });
+    await view.expectQuiet();
+    const { welcome } = await join(stageId, "view");
+    expect(welcome.snapshot).toMatchObject({ revision: 1, items: [wall("a")] });
+  });
+
+  it("acks a commit that changes nothing with the current revision and broadcasts no patch", async () => {
+    const stageId = freshStage();
+    const { client: writer, epoch } = await writerOf(stageId);
+    const { client: view } = await join(stageId, "view");
+    const frame = { x: 0, y: 0, width: 400, height: 300 };
+    writer.send(commit(epoch, "r1", { frame, upserts: [wall("a"), wall("b")] }));
+    expect(await writer.expect("ack")).toMatchObject({ ok: true, revision: 1 });
+    await view.expect("scene.patch");
+
+    writer.send(commit(epoch, "same", { frame, upserts: [wall("a")], removes: ["gone"] }));
+    expect(await writer.expect("ack")).toMatchObject({ ok: true, revision: 1 });
+    writer.send(commit(epoch, "same-reset", { reset: true, upserts: [wall("b"), wall("a")] }));
+    expect(await writer.expect("ack")).toMatchObject({ ok: true, revision: 1 });
+    writer.send(commit(epoch, "empty", {}));
+    expect(await writer.expect("ack")).toMatchObject({ ok: true, revision: 1 });
+    await view.expectQuiet();
+
+    writer.send(commit(epoch, "shrink", { reset: true, upserts: [wall("a")] }));
+    expect(await writer.expect("ack")).toMatchObject({ ok: true, revision: 2 });
+    expect(await view.expect("scene.patch")).toMatchObject({ revision: 2, reset: true });
   });
 });
 
@@ -410,7 +358,7 @@ describe("assets", () => {
     expect(image.status).toBe(200);
     expect(image.headers.get("Content-Type")).toBe("image/png");
     expect(image.headers.get("Access-Control-Allow-Origin")).toBe("*");
-    expect(image.headers.get("Cache-Control")).toContain("immutable");
+    expect(image.headers.get("Cache-Control")).toBe("private, max-age=31536000, immutable");
     expect(new Uint8Array(await image.arrayBuffer())).toEqual(asset.bytes);
 
     expect((await exports.default.fetch(`${url}?token=wrong`)).status).toBe(403);
@@ -453,8 +401,6 @@ describe("assets", () => {
     writer.send(commit(epoch, "keep-oldest", { upserts: [cutout("kept", assets[0]!)] }));
     await writer.expect("ack");
     for (let index = 1; index <= capacity; index++) {
-      // Stay under the 60 messages per second budget.
-      await new Promise((resolve) => setTimeout(resolve, 20));
       writer.send(put(epoch, `p${index}`, assets[index]!));
       expect(await writer.expect("ack")).toMatchObject({ ok: true });
     }
@@ -469,6 +415,27 @@ describe("assets", () => {
     expect(await status(1)).toBe(404);
     expect(await status(2)).toBe(200);
     expect(await status(capacity)).toBe(200);
+  });
+
+  it("counts a repeat upload as fresh, so the commit that follows still finds it", async () => {
+    const stageId = freshStage();
+    const { client: writer, epoch } = await writerOf(stageId);
+    const capacity = 2 * MAX_CUTOUTS_PER_STAGE;
+    const assets = await Promise.all(
+      Array.from({ length: capacity + 1 }, (_, index) => png(8, 8, 5_000 + index)),
+    );
+    const upload = async (index: number) => {
+      writer.send(put(epoch, `p${index}-${Math.random()}`, assets[index]!));
+      expect(await writer.expect("ack")).toMatchObject({ ok: true });
+    };
+    for (let index = 0; index < capacity; index++) await upload(index);
+    await upload(0);
+    await upload(capacity);
+
+    writer.send(commit(epoch, "use-first", { upserts: [cutout("c", assets[0]!)] }));
+    expect(await writer.expect("ack")).toMatchObject({ ok: true });
+    writer.send(commit(epoch, "use-second", { upserts: [cutout("d", assets[1]!)] }));
+    expect(await writer.expect("ack")).toMatchObject({ ok: false, error: "missing_asset" });
   });
 });
 
@@ -576,17 +543,12 @@ describe("cursors", () => {
 describe("rate limit", () => {
   it("drops frames past 60 per second with a single limit error", async () => {
     const stageId = freshStage();
-    const { client } = await writerOf(stageId);
+    await writerOf(stageId);
+    const { client } = await join(stageId, "view");
     for (let index = 0; index < 100; index++) client.send({ type: "ping", t: index });
     client.send({ type: "ping", t: -1 });
 
-    const received: ServerMessage[] = [];
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    for (;;) {
-      const message = await client.next().catch(() => undefined);
-      if (message === undefined) break;
-      received.push(message);
-    }
+    const received = await drain(client);
     const errors = received.filter((message) => message.type === "error");
     const pongs = received.filter((message) => message.type === "pong");
     expect(errors).toEqual([expect.objectContaining({ code: "limit" })]);
@@ -596,4 +558,57 @@ describe("rate limit", () => {
     await new Promise((resolve) => setTimeout(resolve, 1_100));
     await client.expectQuiet();
   });
+
+  it("gives the writer 150 frames a second and answers its requests past that with limit acks", async () => {
+    const stageId = freshStage();
+    const { client: writer, epoch } = await writerOf(stageId);
+    const asset = await png(8, 8, 77);
+    for (let index = 0; index < 300; index++) writer.send({ type: "ping", t: index });
+    const sent = Array.from({ length: 20 }, (_, index) => `r${index}`);
+    for (const [index, requestId] of sent.entries()) {
+      writer.send(commit(epoch, requestId, { upserts: [wall(`w${index}`)] }));
+    }
+    writer.send(put(epoch, "upload", asset));
+
+    const received = await drain(writer);
+    const pongs = received.filter((message) => message.type === "pong");
+    expect(pongs.length).toBeGreaterThanOrEqual(148);
+    expect(pongs.length).toBeLessThan(300);
+    const acks = received.filter((message) => message.type === "ack");
+    expect(acks.map((ack) => ack.requestId)).toEqual([...sent, "upload"]);
+    const limited = acks.filter((ack) => !ack.ok);
+    expect(limited.length).toBeGreaterThan(0);
+    expect(limited).toEqual(limited.map(() => expect.objectContaining({ error: "limit" })));
+
+    writer.send(put(epoch, "upload-again", asset));
+    expect(await writer.expect("ack")).toMatchObject({ ok: true });
+  });
+
+  it("closes a malformed or oversized frame with its close code even past the budget", async () => {
+    const stageId = freshStage();
+    await writerOf(stageId);
+    const flood = async (frame: string) => {
+      const { client } = await join(stageId, "view");
+      for (let index = 0; index < 100; index++) client.send({ type: "ping", t: index });
+      client.send(frame);
+      return (await within(client.closed, 3_000))?.code;
+    };
+    expect(await flood("{not json")).toBe(CLOSE.malformed);
+    expect(
+      await flood(JSON.stringify({ type: "ping", t: 1, pad: "x".repeat(MAX_FRAME_CHARACTERS) })),
+    ).toBe(CLOSE.tooLarge);
+  });
 });
+
+/** Every frame the client receives until none arrives for 3 s. */
+async function drain(client: Client): Promise<ServerMessage[]> {
+  const received: ServerMessage[] = [];
+  for (;;) {
+    const message = await client.next().catch(() => undefined);
+    if (message === undefined) return received;
+    received.push(message);
+  }
+}
+
+const within = <T>(promise: Promise<T>, ms: number): Promise<T | undefined> =>
+  Promise.race([promise, new Promise<undefined>((resolve) => setTimeout(resolve, ms))]);

@@ -64,7 +64,8 @@ export type StageItem =
           rect: Rect;
           asset: AssetRef;
           /**
-           * Milestone 2. Server-owned: the Stage object sets it, and a writer commit that omits it keeps the stored value.
+           * Milestone 2. Server-owned: the Stage object sets it, and a writer commit keeps the stored value while the
+           * cutout's asset hash stays the same.
            */
           meshUrl?: string;
       }
@@ -171,6 +172,10 @@ export const CLOSE = {
     uninitialized: 4409,
     malformed: 1002,
     tooLarge: 1009,
+    /** No hello within 10 s of connecting, or more frames waiting than the Stage keeps for one socket. */
+    policy: 1008,
+    /** The stage holds 64 sockets, or this presenceId holds 8. Retry with backoff. */
+    full: 1013,
 } as const;
 
 /** Views fetch cutout PNGs over HTTPS: GET {backendUrl}/api/stages/{stageId}/assets/{hash}?token={token}. */

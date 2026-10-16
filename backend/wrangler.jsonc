@@ -19,6 +19,8 @@
   },
   "observability": {
     "enabled": true,
+    // Asset URLs carry the stage token in their query string.
+    "redact_query_string": true,
     "traces": {
       "enabled": true,
     },
