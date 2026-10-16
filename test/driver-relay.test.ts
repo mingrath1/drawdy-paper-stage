@@ -455,7 +455,7 @@ describe("Relay", () => {
     });
 
     it("passes walkers on and reports rejected commits", () => {
-        const { socket } = connect();
+        const { relay, socket } = connect();
         const walker = { connectionId: "v1", participant, pose: { x: 1, y: 2, heading: 0, pitch: 0 } };
         socket.receive({
             type: "welcome",
@@ -466,10 +466,40 @@ describe("Relay", () => {
             walkers: [walker],
         });
         socket.receive({ type: "walker.left", connectionId: "v1" });
-        socket.receive({ type: "ack", requestId: "r1", ok: false, error: "bad_message", message: "bad item" });
+        relay.commit(1, desired([wall("w")]));
+        const sent = socket.sent.at(-1) as Extract<ClientMessage, { type: "scene.commit" }>;
+        socket.receive({ type: "ack", requestId: sent.requestId, ok: false, error: "bad_message", message: "bad item" });
         expect(handlers.walker).toHaveBeenCalledWith(walker);
         expect(handlers.walkerLeft).toHaveBeenCalledWith("v1");
         expect(handlers.rejected).toHaveBeenCalledWith("bad_message", "bad item");
+    });
+
+    it("ignores a late ack for a request it no longer waits on, so it keeps writing after re-election", () => {
+        const { relay, socket } = connect();
+        socket.receive({
+            type: "welcome",
+            v: 2,
+            connectionId: "c1",
+            writer: { connectionId: "c1", epoch: 1 },
+            snapshot,
+            walkers: [],
+        });
+        relay.commit(1, desired([wall("w")]));
+        const first = socket.sent.at(-1) as Extract<ClientMessage, { type: "scene.commit" }>;
+        vi.advanceTimersByTime(ACK_TIMEOUT_MS + 1_000);
+        socket.receive({ type: "writer", writer: { connectionId: "c1", epoch: 2 } });
+        socket.receive({
+            type: "ack",
+            requestId: first.requestId,
+            ok: false,
+            error: "stale_epoch",
+            message: "epoch 1 is over",
+        });
+        expect(handlers.rejected).not.toHaveBeenCalled();
+        expect(relay.writerEpoch).toBe(2);
+        relay.commit(2, desired([wall("w")]));
+        vi.advanceTimersByTime(SEND_GAP_MS);
+        expect(socket.sent.at(-1)).toMatchObject({ type: "scene.commit", epoch: 2, reset: true, upserts: [wall("w")] });
     });
 
     it("pings every 10 seconds", () => {
@@ -597,20 +627,20 @@ describe("Outbox", () => {
         const outbox = new Outbox(clock);
         outbox.push([put("p"), commit("c1"), commit("c2")]);
         for (let i = 0; i < 3; i++, now += SEND_GAP_MS) drain(outbox);
-        expect(outbox.settle("c1", false)).toBe(false);
+        expect(outbox.settle("c1", false)?.resync).toBe(false);
         expect(drain(outbox)).toEqual(["p"]);
 
         const second = new Outbox(clock);
         second.push([commit("c1"), commit("c2")]);
         for (let i = 0; i < 2; i++, now += SEND_GAP_MS) drain(second);
-        expect(second.settle("c2", false)).toBe(true);
+        expect(second.settle("c2", false)?.resync).toBe(true);
     });
 
     it("replays a rate-limited commit under its requestId after a backoff", () => {
         const outbox = new Outbox(clock);
         outbox.push([commit("c1"), put("p")]);
         for (let i = 0; i < 2; i++, now += SEND_GAP_MS) drain(outbox);
-        expect(outbox.settle("c1", true)).toBe(false);
+        expect(outbox.settle("c1", true)?.resync).toBe(false);
         expect(outbox.take()).toEqual({ waitMs: 1_000 });
         now += 1_000;
         expect(drain(outbox)).toEqual(["c1"]);
@@ -622,7 +652,7 @@ describe("Outbox", () => {
         const outbox = new Outbox(clock);
         outbox.push([commit("c1"), put("p"), commit("c2")]);
         for (let i = 0; i < 3; i++, now += SEND_GAP_MS) drain(outbox);
-        expect(outbox.settle("c1", true)).toBe(true);
+        expect(outbox.settle("c1", true)?.resync).toBe(true);
         now += 1_000;
         expect(drain(outbox)).toEqual(["p"]);
         now += SEND_GAP_MS;

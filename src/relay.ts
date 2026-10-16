@@ -182,12 +182,13 @@ export class Outbox {
     }
 
     /**
-     * Settles an ack and returns true when the writer must resync. The server answers a socket in order, so anything
-     * sent before the acked message and still unanswered was dropped.
+     * Settles an ack and returns the message it answers, with `resync` set when the writer must resync. The server
+     * answers a socket in order, so anything sent before the acked message and still unanswered was dropped. Returns
+     * null for an ack this outbox no longer waits on: a second answer to a resent message, or one from before a clear.
      */
-    settle(requestId: string, limited: boolean): boolean {
+    settle(requestId: string, limited: boolean): { message: WriterMessage; resync: boolean } | null {
         const index = this.inFlight.findIndex((entry) => entry.message.requestId === requestId);
-        if (index < 0) return false;
+        if (index < 0) return null;
         const dropped = this.inFlight.splice(0, index).map((entry) => entry.message);
         const answered = this.inFlight.shift()!.message;
         let resync = dropped.some(isCommit);
@@ -205,7 +206,7 @@ export class Outbox {
             this.limits = 0;
         }
         this.queue.unshift(...replay);
-        return resync;
+        return { message: answered, resync };
     }
 
     /** Once the oldest unanswered message has waited too long, puts every unanswered message back at the front. */
@@ -371,7 +372,10 @@ export class Relay {
                 return;
             case "ack": {
                 const limited = !message.ok && message.error === "limit";
-                if (this.outbox.settle(message.requestId, limited)) {
+                const settled = this.outbox.settle(message.requestId, limited);
+                // A late answer can carry a stale_epoch from before a re-election; it says nothing about now.
+                if (!settled || settled.message.epoch !== this.session.epoch) return;
+                if (settled.resync) {
                     this.session.resync();
                     this.handlers.syncNeeded();
                 }
