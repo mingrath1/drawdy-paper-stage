@@ -20,7 +20,7 @@ type Body = {
     doll: Mesh<PlaneGeometry, MeshLambertMaterial>;
     label: Sprite;
     heardAt: number;
-    /** 1 while the walker is fresh, easing to 0 once it has been quiet for WALKER_TTL_MS. */
+    /** 1 while the walker is fresh, easing to 0 once it has been quiet for WALKER_TTL_MS, when the body goes. */
     shown: number;
 };
 
@@ -58,18 +58,18 @@ export class Bodies {
     }
 
     presenceIds(): string[] {
-        return [...this.bodies.values()]
-            .filter((body) => body.shown > 0)
-            .map((body) => body.walker.participant.presenceId);
+        return [...this.bodies.values()].map((body) => body.walker.participant.presenceId);
     }
 
     update(dt: number, now: number, frame: Rect): void {
         const follow = 1 - Math.exp(-10 * dt);
-        for (const body of this.bodies.values()) {
+        for (const [id, body] of this.bodies) {
             const fresh = now - body.heardAt < WALKER_TTL_MS;
             body.shown += ((fresh ? 1 : 0) - body.shown) * follow;
-            if (!fresh && body.shown < 0.01) body.shown = 0;
-            body.group.visible = body.shown > 0;
+            if (!fresh && body.shown < 0.01) {
+                this.remove(id);
+                continue;
+            }
             body.group.scale.setScalar(Math.max(body.shown, 0.001));
             const { x, z } = canvasToWorld(body.walker.pose.x, body.walker.pose.y, frame);
             body.group.position.x += (x - body.group.position.x) * follow;

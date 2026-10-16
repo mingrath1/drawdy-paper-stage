@@ -1,6 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { canvasToWorld, worldToCanvas, type Rect, type StageItem, type StageSnapshot } from "../shared/protocol";
+import {
+    WALKER_TTL_MS,
+    canvasToWorld,
+    worldToCanvas,
+    type Rect,
+    type StageItem,
+    type StageSnapshot,
+    type Walker,
+} from "../shared/protocol";
 import { AssetCache } from "../view/assets";
+import { Bodies } from "../view/bodies";
 import { HAND_TTL_MS, Hands } from "../view/hands";
 import { StageModel } from "../view/stage";
 import { WalkControls } from "../view/walk";
@@ -288,5 +297,29 @@ describe("hands", () => {
         hands.set([ann], frame, 3200);
         runFor(hands, 3200, 1000);
         expect(visibleHands(hands)).toBe(1);
+    });
+});
+
+describe("bodies", () => {
+    const mali: Walker = {
+        connectionId: "c1",
+        participant: { presenceId: "mali", name: "Mali", color: "#0ea5e9" },
+        pose: { x: 600, y: 400, heading: 0, pitch: 0 },
+    };
+
+    it("removes and frees a quiet walker's body once it has faded, and brings it back with the next pose", () => {
+        const bodies = new Bodies();
+        bodies.set(mali, frame, 0);
+        const freed: string[] = [];
+        bodies.root.traverse((object) => {
+            const material = (object as Mesh).material as Mesh["material"] | undefined;
+            if (material && !Array.isArray(material)) material.addEventListener("dispose", () => freed.push(object.type));
+        });
+        for (let t = 0; t <= WALKER_TTL_MS + 2000; t += 100) bodies.update(0.1, t, frame);
+        expect(bodies.root.children).toHaveLength(0);
+        expect(freed.sort()).toEqual(["Mesh", "Sprite"]);
+        bodies.set(mali, frame, WALKER_TTL_MS + 2100);
+        bodies.update(0.1, WALKER_TTL_MS + 2200, frame);
+        expect(bodies.root.children.filter((body) => body.visible)).toHaveLength(1);
     });
 });
