@@ -63,7 +63,9 @@ export type StageItem =
           /** The screenshot area in canvas units. The PNG already shows the element's rotation, so cutouts carry none. */
           rect: Rect;
           asset: AssetRef;
-          /** Milestone 2. Set when a mesh replaces the paper cutout. */
+          /**
+           * Milestone 2. Server-owned: the Stage object sets it, and a writer commit that omits it keeps the stored value.
+           */
           meshUrl?: string;
       }
     | {
@@ -156,12 +158,17 @@ export type ServerMessage =
 
 export type Walker = { connectionId: ConnectionId; participant: Participant; pose: Pose };
 
-export type ErrorCode = "bad_message" | "bad_token" | "version" | "too_large" | "limit" | "not_writer";
+/**
+ * `uninitialized` means no driver has registered this stage's token yet. A view that gets it retries with backoff.
+ * The driver opens the view only after its own `welcome`, so this is a rare race, not the normal path.
+ */
+export type ErrorCode = "bad_message" | "bad_token" | "uninitialized" | "version" | "too_large" | "limit" | "not_writer";
 
 /** WebSocket close codes the Stage object uses. */
 export const CLOSE = {
     badToken: 4401,
     badVersion: 4426,
+    uninitialized: 4409,
     malformed: 1002,
     tooLarge: 1009,
 } as const;
@@ -198,6 +205,24 @@ export function canvasToWorld(x: number, y: number, frame: Rect): { x: number; z
         x: (x - (frame.x + frame.width / 2)) / CANVAS_UNITS_PER_METER,
         z: (y - (frame.y + frame.height / 2)) / CANVAS_UNITS_PER_METER,
     };
+}
+
+/** The center of a rect on the 3D floor. */
+export function rectCenterToWorld(rect: Rect, frame: Rect): { x: number; z: number } {
+    return canvasToWorld(rect.x + rect.width / 2, rect.y + rect.height / 2, frame);
+}
+
+/**
+ * Three.js is y-up and right-handed with canvas y mapped to +z, so a clockwise board rotation is a negative turn
+ * about +y. Use this for `mesh.rotation.y` of a wall.
+ */
+export function boardRotationToYaw(rotation: number): number {
+    return -rotation;
+}
+
+/** Camera yaw about +y for a pose heading, given the camera looks down its own -z. */
+export function headingToCameraYaw(heading: number): number {
+    return Math.PI + heading;
 }
 
 export function worldToCanvas(x: number, z: number, frame: Rect): { x: number; y: number } {
