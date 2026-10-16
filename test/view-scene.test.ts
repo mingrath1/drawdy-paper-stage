@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { canvasToWorld, worldToCanvas, type Rect, type StageItem, type StageSnapshot } from "../shared/protocol";
 import { AssetCache } from "../view/assets";
+import { HAND_TTL_MS, Hands } from "../view/hands";
 import { StageModel } from "../view/stage";
 import { WalkControls } from "../view/walk";
 import { DirectionalLight, Mesh, Texture, Vector3, type Object3D } from "../view/vendor/three.module.js";
@@ -239,5 +240,53 @@ describe("where the walker stands", () => {
         const after = worldToCanvas(walk.position.x, walk.position.z, grown);
         expect(after.x).toBeCloseTo(spot.x, 6);
         expect(after.y).toBeCloseTo(spot.y, 6);
+    });
+});
+
+describe("hands", () => {
+    const ann = { presenceId: "ann", name: "Ann", color: "#a855f7", x: 600, y: 400 };
+    const me = { presenceId: "me", name: "Me", color: "#f97316", x: 500, y: 400 };
+    const visibleHands = (hands: Hands) => hands.root.children.filter((hand) => hand.visible).length;
+    const runFor = (hands: Hands, from: number, ms: number) => {
+        for (let t = from; t <= from + ms; t += 100) hands.update(0.1, t, frame);
+    };
+
+    it("never shows this viewer's own hand", () => {
+        const hands = new Hands("me");
+        hands.set([ann, me], frame, 0);
+        runFor(hands, 0, 1000);
+        expect(visibleHands(hands)).toBe(1);
+        expect(hands.presenceIds(1000)).toEqual(["ann"]);
+    });
+
+    it("fades out and deletes a hand that has not been heard from for a while", () => {
+        const hands = new Hands("me");
+        hands.set([ann], frame, 0);
+        runFor(hands, 0, HAND_TTL_MS - 100);
+        expect(visibleHands(hands)).toBe(1);
+        runFor(hands, HAND_TTL_MS, 2000);
+        expect(hands.root.children).toHaveLength(0);
+        expect(hands.presenceIds(HAND_TTL_MS + 2000)).toEqual([]);
+    });
+
+    it("keeps a hand that is heard from again", () => {
+        const hands = new Hands("me");
+        hands.set([ann], frame, 0);
+        runFor(hands, 0, HAND_TTL_MS - 100);
+        hands.set([{ ...ann, x: 700 }], frame, HAND_TTL_MS - 100);
+        runFor(hands, HAND_TTL_MS, 2000);
+        expect(visibleHands(hands)).toBe(1);
+    });
+
+    it("fades out every hand when cleared, as on a welcome, a disconnect, or a new writer", () => {
+        const hands = new Hands("me");
+        hands.set([ann], frame, 0);
+        runFor(hands, 0, 1000);
+        hands.clear();
+        runFor(hands, 1100, 2000);
+        expect(hands.root.children).toHaveLength(0);
+        hands.set([ann], frame, 3200);
+        runFor(hands, 3200, 1000);
+        expect(visibleHands(hands)).toBe(1);
     });
 });

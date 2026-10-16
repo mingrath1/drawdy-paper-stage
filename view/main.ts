@@ -72,6 +72,7 @@ const HANDLERS: { [K in ServerMessage["type"]]: (message: Extract<ServerMessage,
             stage.frame,
             performance.now(),
         );
+        hands.clear();
         poseClock = IDLE_POSE_CLOCK;
     },
     "scene.patch"(message) {
@@ -87,12 +88,14 @@ const HANDLERS: { [K in ServerMessage["type"]]: (message: Extract<ServerMessage,
         bodies.remove(message.connectionId);
     },
     cursors(message) {
-        if (stage.frame) hands.set(message.cursors, stage.frame);
+        if (stage.frame) hands.set(message.cursors, stage.frame, performance.now());
     },
     error(message) {
         console.warn("paper-stage:", message.code, message.message);
     },
-    writer() {},
+    writer() {
+        hands.clear();
+    },
     ack() {},
     pong() {},
 };
@@ -100,7 +103,10 @@ const HANDLERS: { [K in ServerMessage["type"]]: (message: Extract<ServerMessage,
 const link = new StageLink(
     boot,
     (message) => (HANDLERS[message.type] as (message: ServerMessage) => void)(message),
-    (status) => hud.link(status),
+    (status) => {
+        hud.link(status);
+        if (status.kind !== "live") hands.clear();
+    },
 );
 
 function resize(): void {
@@ -135,7 +141,7 @@ renderer.setAnimationLoop(() => {
     stage.update(dt, walk.position);
     if (frame) {
         bodies.update(dt, now, frame);
-        hands.update(dt, now / 1000, frame);
+        hands.update(dt, now, frame);
     }
     renderer.render(scene, camera);
 
@@ -148,6 +154,6 @@ renderer.setAnimationLoop(() => {
         frames = 0;
         windowStart = now;
         hud.frameRate(stats.fps);
-        hud.count(new Set([boot.participant.presenceId, ...bodies.presenceIds(), ...hands.presenceIds()]).size);
+        hud.count(new Set([boot.participant.presenceId, ...bodies.presenceIds(), ...hands.presenceIds(now)]).size);
     }
 });

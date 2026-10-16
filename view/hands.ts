@@ -12,6 +12,11 @@ import {
 import { glowSpot, glowingHand, nameLabel } from "./drawings";
 import { handPlan } from "./layout";
 
+/**
+ * The writer sends cursors only when one moves, so a hand also fades after this long without news. That catches a
+ * person the writer stopped reporting, at the cost of fading someone who holds still this long.
+ */
+export const HAND_TTL_MS = 30_000;
 const HAND_SPRITE_WIDTH_M = 1.0;
 const HAND_SPRITE_HEIGHT_M = 1.25;
 const spotGeometry = new PlaneGeometry(1.4, 1.4).rotateX(-Math.PI / 2).translate(0, 0.02, 0);
@@ -23,9 +28,10 @@ type Hand = {
     group: Group;
     hand: Sprite;
     disposables: { dispose(): void }[];
-    /** 1 while the cursor is over the stage, easing to 0 when it leaves or is gone. */
+    /** When the writer last listed this cursor. -Infinity once it is gone from the list or cleared. */
+    heardAt: number;
+    /** 1 while the cursor is fresh and over the stage, easing to 0 when it leaves or goes stale. */
     shown: number;
-    gone: boolean;
     phase: number;
 };
 
@@ -37,7 +43,7 @@ export class Hands {
     constructor(private readonly selfPresenceId: string) {}
 
     /** Takes the writer's full list of cursors. A person missing from it fades out. */
-    set(cursors: Cursor[], frame: Rect): void {
+    set(cursors: Cursor[], frame: Rect, now: number): void {
         const listed = new Set<string>();
         for (const cursor of cursors) {
             if (cursor.presenceId === this.selfPresenceId) continue;
@@ -45,27 +51,32 @@ export class Hands {
             const hand = this.hands.get(cursor.presenceId);
             if (hand && hand.cursor.color === cursor.color && hand.cursor.name === cursor.name) {
                 hand.cursor = cursor;
-                hand.gone = false;
+                hand.heardAt = now;
             } else {
                 if (hand) this.remove(cursor.presenceId);
-                this.hands.set(cursor.presenceId, this.create(cursor, frame));
+                this.hands.set(cursor.presenceId, this.create(cursor, frame, now));
             }
         }
-        for (const [id, hand] of this.hands) if (!listed.has(id)) hand.gone = true;
+        for (const [id, hand] of this.hands) if (!listed.has(id)) hand.heardAt = -Infinity;
     }
 
-    presenceIds(): string[] {
-        return [...this.hands.values()].filter((hand) => !hand.gone).map((hand) => hand.cursor.presenceId);
+    /** Fades out every hand, for when the list they came from no longer holds: a welcome, a disconnect, a new writer. */
+    clear(): void {
+        for (const hand of this.hands.values()) hand.heardAt = -Infinity;
     }
 
-    update(dt: number, seconds: number, frame: Rect): void {
+    presenceIds(now: number): string[] {
+        return [...this.hands.values()].filter((hand) => fresh(hand, now)).map((hand) => hand.cursor.presenceId);
+    }
+
+    update(dt: number, now: number, frame: Rect): void {
         const follow = 1 - Math.exp(-10 * dt);
         for (const [id, hand] of this.hands) {
             const plan = handPlan(hand.cursor, frame);
-            const showing = plan.inFrame && !hand.gone;
+            const showing = plan.inFrame && fresh(hand, now);
             hand.shown += ((showing ? 1 : 0) - hand.shown) * follow;
             if (!showing && hand.shown < 0.01) {
-                if (hand.gone) {
+                if (!fresh(hand, now)) {
                     this.remove(id);
                     continue;
                 }
@@ -75,11 +86,11 @@ export class Hands {
             hand.group.scale.setScalar(Math.max(hand.shown, 0.001));
             hand.group.position.x += (plan.position.x - hand.group.position.x) * follow;
             hand.group.position.z += (plan.position.z - hand.group.position.z) * follow;
-            hand.hand.position.y = plan.hoverHeight + Math.sin(seconds * 2.2 + hand.phase) * 0.06;
+            hand.hand.position.y = plan.hoverHeight + Math.sin((now / 1000) * 2.2 + hand.phase) * 0.06;
         }
     }
 
-    private create(cursor: Cursor, frame: Rect): Hand {
+    private create(cursor: Cursor, frame: Rect, now: number): Hand {
         let texture = handTextures.get(cursor.color);
         if (!texture) {
             texture = glowingHand(cursor.color);
@@ -108,8 +119,8 @@ export class Hands {
             group,
             hand,
             disposables: [handMaterial, spotMaterial, label.material, label.material.map!],
+            heardAt: now,
             shown: 0,
-            gone: false,
             phase: Math.random() * Math.PI * 2,
         };
     }
@@ -121,4 +132,8 @@ export class Hands {
         for (const resource of hand.disposables) resource.dispose();
         this.hands.delete(id);
     }
+}
+
+function fresh(hand: Hand, now: number): boolean {
+    return now - hand.heardAt < HAND_TTL_MS;
 }
