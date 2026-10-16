@@ -109,7 +109,7 @@ async function seedSession<T>(
   options: HarnessOptions,
   seed: (harness: Harness) => Promise<T>,
 ): Promise<T> {
-  const stub = env.SESSIONS.getByName(sessionId);
+  const stub = env.STAGES.getByName(sessionId);
   const result = await runInDurableObject(stub, async (_instance, state) => {
     // Let the Session finish opening its harness before writing beside it.
     await state.blockConcurrencyWhile(async () => {});
@@ -293,7 +293,7 @@ describe("chat application", () => {
     );
     socket.close(1000, "reconnect test");
     await closed;
-    await evictDurableObject(env.SESSIONS.getByName(sessionId));
+    await evictDurableObject(env.STAGES.getByName(sessionId));
     const reopened = await exports.default.fetch(
       sessionSocketUrl(sessionId, "Alice", "retry-client-2"),
       { headers: { Upgrade: "websocket" } },
@@ -359,7 +359,7 @@ describe("chat application", () => {
     );
     socket.close(1000, "retry after eviction");
     await closed;
-    await evictDurableObject(env.SESSIONS.getByName(sessionId));
+    await evictDurableObject(env.STAGES.getByName(sessionId));
 
     const reopened = await exports.default.fetch(
       sessionSocketUrl(sessionId, "Alice", "create-retry-client-2"),
@@ -481,7 +481,7 @@ describe("chat application", () => {
     );
     expect(created.conversationId).toEqual(expect.any(Number));
 
-    await evictDurableObject(env.SESSIONS.getByName(sessionId));
+    await evictDurableObject(env.STAGES.getByName(sessionId));
     await configureOfflineModel(sessionId, created.conversationId);
     socket.send(
       JSON.stringify({
@@ -541,7 +541,7 @@ describe("chat application", () => {
       ),
     ).resolves.toMatchObject({ usernames: ["Alice"] });
 
-    await evictDurableObject(env.SESSIONS.getByName(sessionId));
+    await evictDurableObject(env.STAGES.getByName(sessionId));
     bobSocket.send(
       JSON.stringify({
         type: "conversation.open",

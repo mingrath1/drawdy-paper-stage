@@ -8,7 +8,7 @@ registerStorageConformance(
   { describe, expect, it },
   "Cloudflare Durable Object SQLite",
   async (use) => {
-    const stub = env.SESSIONS.get(env.SESSIONS.newUniqueId());
+    const stub = env.STAGES.get(env.STAGES.newUniqueId());
     await runInDurableObject(stub, async (_instance, state) => {
       await use(await openDurableObjectSqliteStorage(state.storage));
     });

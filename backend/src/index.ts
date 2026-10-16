@@ -1,4 +1,4 @@
-export { Session } from "./session.ts";
+export { Session as Stage } from "./session.ts";
 
 const json = (body: unknown, status: number, headers?: HeadersInit): Response =>
   Response.json(body, { status, headers });
@@ -26,7 +26,7 @@ export default {
         return json({ error: "WebSocket upgrade required" }, 426, { Upgrade: "websocket" });
       }
       // Demo-only surface: authenticate and rate limit before exposing model-backed rooms publicly.
-      return env.SESSIONS.getByName(sessionMatch[1]).fetch(request);
+      return env.STAGES.getByName(sessionMatch[1]).fetch(request);
     }
 
     return json({ error: "Not found" }, 404);

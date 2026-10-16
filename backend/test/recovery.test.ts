@@ -44,7 +44,7 @@ describe("session recovery", () => {
     };
 
     const sessionId = "in-flight-recovery";
-    const stub = env.SESSIONS.getByName(sessionId);
+    const stub = env.STAGES.getByName(sessionId);
     await runInDurableObject(stub, async (_instance, state) => {
       const storage = await openStorage(state);
       const harness = await openFauxHarness(storage, [interrupted]);
@@ -94,7 +94,7 @@ describe("session recovery", () => {
 
   it("re-arms and submits a persisted scheduled instruction after eviction", async () => {
     const sessionId = "scheduled-instruction-recovery";
-    const stub = env.SESSIONS.getByName(sessionId);
+    const stub = env.STAGES.getByName(sessionId);
     await runInDurableObject(stub, async (_instance, state) => {
       const registry = createRegistry();
       registry.install(defineExtension({ name: "schedule", tasks: [DeliverScheduledInstruction] }));
@@ -167,7 +167,7 @@ describe("session recovery", () => {
 
   it("deletes the platform alarm when scheduled work is no longer actionable", async () => {
     const sessionId = "obsolete-platform-alarm";
-    const stub = env.SESSIONS.getByName(sessionId);
+    const stub = env.STAGES.getByName(sessionId);
     await runInDurableObject(stub, async (_instance, state) => {
       const registry = createRegistry();
       registry.install(defineExtension({ name: "schedule", tasks: [DeliverScheduledInstruction] }));

@@ -1,25 +1,21 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "pi-durable-cloudflare-do",
+  "name": "paper-stage-backend",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-23",
   "durable_objects": {
     "bindings": [
       {
-        "name": "SESSIONS",
-        "class_name": "Session",
+        "name": "STAGES",
+        "class_name": "Stage",
       },
     ],
   },
   "exports": {
-    "Session": {
+    "Stage": {
       "type": "durable-object",
       "storage": "sqlite",
     },
-  },
-  "assets": {
-    "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*"],
   },
   "observability": {
     "enabled": true,
