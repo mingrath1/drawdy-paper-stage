@@ -358,7 +358,7 @@ describe("assets", () => {
     expect(image.status).toBe(200);
     expect(image.headers.get("Content-Type")).toBe("image/png");
     expect(image.headers.get("Access-Control-Allow-Origin")).toBe("*");
-    expect(image.headers.get("Cache-Control")).toContain("immutable");
+    expect(image.headers.get("Cache-Control")).toBe("private, max-age=31536000, immutable");
     expect(new Uint8Array(await image.arrayBuffer())).toEqual(asset.bytes);
 
     expect((await exports.default.fetch(`${url}?token=wrong`)).status).toBe(403);

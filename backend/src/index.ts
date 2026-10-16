@@ -31,8 +31,8 @@ async function readAsset(
         headers: {
           ...CORS,
           "Content-Type": "image/png",
-          // Content-addressed: the bytes behind a hash never change.
-          "Cache-Control": "public, max-age=31536000, immutable",
+          // Content-addressed, so the bytes never change. Private, because the URL carries the stage token.
+          "Cache-Control": "private, max-age=31536000, immutable",
           "Cross-Origin-Resource-Policy": "cross-origin",
         },
       });
