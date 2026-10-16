@@ -447,6 +447,15 @@ describe("Relay", () => {
         expect(socket.sent.at(-1)).toEqual({ type: "cursors", epoch: 5, cursors: [{ ...participant, x: 1, y: 2 }] });
     });
 
+    it("sends the newest cursors as soon as it becomes the writer", () => {
+        const { relay, socket } = connect();
+        const cursors = [{ ...participant, x: 1, y: 2 }];
+        relay.sendCursors(cursors);
+        expect(socket.sent.map((m) => m.type)).toEqual(["hello"]);
+        elect(socket, 4);
+        expect(socket.sent.filter((m) => m.type === "cursors")).toEqual([{ type: "cursors", epoch: 4, cursors }]);
+    });
+
     it("stops for good on a bad token", () => {
         const { socket } = connect();
         socket.drop(4401);

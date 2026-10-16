@@ -271,6 +271,8 @@ export class Relay {
     private desired: DesiredStage | null = null;
     /** `desired` changed since the last plan. */
     private dirty = false;
+    /** Presence fires only on change, so a newly elected writer relays the last list it heard. */
+    private cursors: Cursor[] | null = null;
 
     constructor(
         private readonly backendUrl: string,
@@ -312,6 +314,7 @@ export class Relay {
     }
 
     sendCursors(cursors: Cursor[]): void {
+        this.cursors = cursors;
         const epoch = this.writerEpoch;
         if (epoch !== null) this.send({ type: "cursors", epoch, cursors });
     }
@@ -441,7 +444,9 @@ export class Relay {
         const epoch = this.session.epoch;
         const becameWriter = this.session.onWriter(writer, entry.connectionId, this.storedAssets);
         if (this.session.epoch !== epoch) this.outbox.clear();
-        if (becameWriter) this.handlers.syncNeeded();
+        if (!becameWriter) return;
+        if (this.cursors) this.sendCursors(this.cursors);
+        this.handlers.syncNeeded();
     }
 
     private tick(): void {
