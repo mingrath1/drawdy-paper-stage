@@ -12,7 +12,7 @@ import {
     Scene,
     WebGLRenderer,
 } from "./vendor/three.module.js";
-import { CutoutTextures } from "./assets";
+import { AssetCache, cutoutLoader, freeCutout } from "./assets";
 import { Bodies } from "./bodies";
 import { Hands } from "./hands";
 import { Hud } from "./hud";
@@ -51,7 +51,8 @@ const desk = new Mesh(
 );
 scene.add(desk);
 
-const stage = new StageModel(new CutoutTextures(boot, renderer.capabilities.getMaxAnisotropy()), sun);
+const anisotropy = renderer.capabilities.getMaxAnisotropy();
+const stage = new StageModel(new AssetCache(cutoutLoader(boot, anisotropy), freeCutout), sun, anisotropy);
 const bodies = new Bodies();
 const hands = new Hands(boot.participant.presenceId);
 scene.add(stage.root, bodies.root, hands.root);

@@ -20,8 +20,9 @@ import {
     Shape,
     Vector2,
     type Object3D,
+    type Texture,
 } from "./vendor/three.module.js";
-import type { CutoutTextures } from "./assets";
+import type { AssetCache } from "./assets";
 import { INK, PAPER, floorPaper, paperMaterial } from "./drawings";
 import {
     cutoutPlan,
@@ -54,8 +55,10 @@ type Kind<I extends StageItem> = {
     /** Applies a new version of the item. Placement is handled for every kind by the caller. */
     update(object: Object3D, item: I, previous: I, frame: Rect, stage: StageModel): void;
     place(item: I, frame: Rect): Placement;
-    dispose(object: Object3D): void;
-    /** Whether the object may start rising; a cutout waits for its texture. */
+    /** Runs every frame. */
+    tick?(object: Object3D, item: I, stage: StageModel): void;
+    dispose(object: Object3D, item: I, stage: StageModel): void;
+    /** Whether the object may start rising; a cutout waits for its picture. */
     ready(object: Object3D): boolean;
 };
 
@@ -142,18 +145,13 @@ function cutoutScale(mesh: Object3D, cutout: CutoutItem, frame: Rect): void {
     mesh.scale.set(plan.width, plan.height, 1);
 }
 
-function showTexture(mesh: Mesh, cutout: CutoutItem, stage: StageModel): void {
-    stage.textures.get(cutout.asset.hash).then(
-        (texture) => {
-            const material = mesh.material as MeshLambertMaterial;
-            if (mesh.userData.hash !== cutout.asset.hash) return;
-            material.map = texture;
-            material.emissiveMap = texture;
-            material.needsUpdate = true;
-            mesh.visible = true;
-        },
-        (error) => console.warn("paper-stage: cutout picture failed", cutout.id, error),
-    );
+/** Shows `picture`, or hides the cutout while it has none. */
+function showPicture(mesh: Mesh, picture: Texture | null): void {
+    const material = mesh.material as MeshLambertMaterial;
+    if (material.map === picture) return;
+    material.map = material.emissiveMap = picture;
+    material.needsUpdate = true;
+    mesh.visible = picture !== null;
 }
 
 const CUTOUT: Kind<CutoutItem> = {
@@ -161,22 +159,26 @@ const CUTOUT: Kind<CutoutItem> = {
         const mesh = new Mesh(cutoutGeometry, paperMaterial());
         mesh.castShadow = true;
         mesh.visible = false;
-        mesh.userData.hash = cutout.asset.hash;
         cutoutScale(mesh, cutout, frame);
-        showTexture(mesh, cutout, stage);
+        stage.textures.acquire(cutout.asset.hash);
         return mesh;
     },
     update(mesh, cutout, previous, frame, stage) {
         cutoutScale(mesh, cutout, frame);
         if (cutout.asset.hash === previous.asset.hash) return;
-        mesh.userData.hash = cutout.asset.hash;
-        showTexture(mesh as Mesh, cutout, stage);
+        stage.textures.acquire(cutout.asset.hash);
+        stage.textures.release(previous.asset.hash);
+        showPicture(mesh as Mesh, null);
     },
     place(cutout, frame) {
         const { center } = cutoutPlan(cutout, frame);
         return { x: center.x, z: center.z, yaw: 0 };
     },
-    dispose(mesh) {
+    tick(mesh, cutout, stage) {
+        showPicture(mesh as Mesh, stage.textures.get(cutout.asset.hash));
+    },
+    dispose(mesh, cutout, stage) {
+        stage.textures.release(cutout.asset.hash);
         ((mesh as Mesh).material as MeshLambertMaterial).dispose();
     },
     ready: (mesh) => mesh.visible,
@@ -224,11 +226,12 @@ export class StageModel {
     private readonly border: LineLoop;
 
     constructor(
-        readonly textures: CutoutTextures,
+        readonly textures: AssetCache<Texture>,
         private readonly sun: DirectionalLight,
+        anisotropy: number,
     ) {
         const paper = floorPaper();
-        paper.anisotropy = textures.anisotropy;
+        paper.anisotropy = anisotropy;
         this.floor = new Mesh(new PlaneGeometry(1, 1).rotateX(-Math.PI / 2), new MeshLambertMaterial({ map: paper }));
         this.floor.receiveShadow = true;
         this.border = new LineLoop(
@@ -255,6 +258,7 @@ export class StageModel {
         const removes = patch.reset ? [...this.nodes.keys()].filter((id) => !kept.has(id)) : patch.removes;
         for (const id of removes) this.remove(id);
         for (const item of patch.upserts) this.upsert(item, frame);
+        if (patch.reset) this.textures.retryFailed();
     }
 
     get walls(): number {
@@ -291,10 +295,12 @@ export class StageModel {
         const follow = 1 - Math.exp(-12 * dt);
         for (const node of this.nodes.values()) {
             const { object, target } = node;
+            const kind = kindOf(node.item);
             object.position.x += (target.x - object.position.x) * follow;
             object.position.z += (target.z - object.position.z) * follow;
             object.rotation.y += angleBetween(object.rotation.y, target.yaw) * follow;
-            if (node.rise < 1 && kindOf(node.item).ready(object)) {
+            kind.tick?.(object, node.item, this);
+            if (node.rise < 1 && kind.ready(object)) {
                 node.rise = Math.min(1, node.rise + dt / RISE_SECONDS);
                 this.showRise(node);
             }
@@ -329,7 +335,7 @@ export class StageModel {
     private remove(id: ElementId): void {
         const node = this.nodes.get(id);
         if (!node) return;
-        kindOf(node.item).dispose(node.object);
+        kindOf(node.item).dispose(node.object, node.item, this);
         this.root.remove(node.object);
         this.nodes.delete(id);
         if (node.item.kind === "wall") this.edgesStale = true;
