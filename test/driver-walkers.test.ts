@@ -9,9 +9,12 @@ type Schema = { type: string; drawdyElementId: string; x: number; y: number; [ke
 
 function fakeDrawdy() {
     const requests: Request[] = [];
+    const failing = new Set<string>();
     let previews = 0;
     const issue = ((request: Request) => {
         requests.push(request);
+        if (failing.has(request.type))
+            return Promise.resolve({ ...request, res: { error: { type: "runtime", message: "busy" } } });
         const value =
             request.type === "command:scene:create-drawdy-preview-elements"
                 ? { previewed: 2, previewId: `pv${++previews}` }
@@ -19,7 +22,7 @@ function fakeDrawdy() {
         return Promise.resolve({ ...request, res: { value } });
     }) as unknown as DriverCommandIssuer;
     const of = (type: string) => requests.filter((request) => request.type === type);
-    return { issue, requests, of };
+    return { issue, requests, of, failing };
 }
 
 const walker = (connectionId: string, x: number, y: number, name = "Ploy"): Walker => ({
@@ -97,6 +100,58 @@ describe("WalkerMarkers", () => {
         await vi.advanceTimersByTimeAsync(4_000);
         expect(drawdy.of("command:scene:delete-drawdy-preview-elements")).toEqual([]);
         expect(drawdy.of("command:scene:update-drawdy-preview-elements")).toEqual([]);
+    });
+
+    it("shows a fading walker at full strength again when its keepalive returns at the same spot", async () => {
+        markers.show(walker("v1", 0, 0));
+        await vi.advanceTimersByTimeAsync(WALKER_TTL_MS + 120);
+        const fading = drawdy.of("command:scene:update-drawdy-preview-elements");
+        expect(dotOf(fading.at(-1)!.req!.elements).opacity).toBeLessThan(1);
+        markers.show(walker("v1", 0, 0));
+        await vi.advanceTimersByTimeAsync(1_000);
+        const last = drawdy.of("command:scene:update-drawdy-preview-elements").at(-1)!;
+        expect(dotOf(last.req!.elements).opacity ?? 1).toBe(1);
+        expect(drawdy.of("command:scene:delete-drawdy-preview-elements")).toEqual([]);
+    });
+
+    it("keeps retrying a failed delete, backing off, until the marker is gone", async () => {
+        markers.show(walker("v1", 0, 0));
+        await vi.advanceTimersByTimeAsync(0);
+        drawdy.failing.add("command:scene:delete-drawdy-preview-elements");
+        markers.leave("v1");
+        await vi.advanceTimersByTimeAsync(60_000);
+        const tries = drawdy.of("command:scene:delete-drawdy-preview-elements");
+        expect(tries.length).toBeGreaterThan(3);
+        expect(tries.length).toBeLessThan(30);
+        expect(tries.every((r) => (r.req!.previewIds as string[]).join() === "pv1")).toBe(true);
+        drawdy.failing.clear();
+        await vi.advanceTimersByTimeAsync(10_000);
+        const after = drawdy.of("command:scene:delete-drawdy-preview-elements").length;
+        expect(after).toBe(tries.length + 1);
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(drawdy.of("command:scene:delete-drawdy-preview-elements")).toHaveLength(after);
+    });
+
+    it("deletes a marker whose delete is still being retried when it stops", async () => {
+        markers.show(walker("v1", 0, 0));
+        markers.show(walker("v2", 50, 50, "Ming"));
+        await vi.advanceTimersByTimeAsync(0);
+        drawdy.failing.add("command:scene:delete-drawdy-preview-elements");
+        markers.leave("v1");
+        await vi.advanceTimersByTimeAsync(1_000);
+        drawdy.failing.clear();
+        await markers.stop();
+        const last = drawdy.of("command:scene:delete-drawdy-preview-elements").at(-1)!;
+        expect([...(last.req!.previewIds as string[])].sort()).toEqual(["pv1", "pv2"]);
+    });
+
+    it("never draws a walker who left or went quiet before its first tick", async () => {
+        markers.show(walker("v1", 0, 0));
+        markers.leave("v1");
+        markers.show(walker("v2", 0, 0));
+        vi.setSystemTime(Date.now() + WALKER_TTL_MS + 1);
+        await vi.advanceTimersByTimeAsync(2_000);
+        expect(drawdy.requests).toEqual([]);
     });
 
     it("removes a walker who left, and every walker when it stops", async () => {
