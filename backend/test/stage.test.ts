@@ -337,6 +337,30 @@ describe("scene", () => {
     expect(await writer.expect("ack")).toMatchObject({ ok: true });
   });
 
+  it("keeps the stored deltas of every stage document bounded across many commits", async () => {
+    const stageId = freshStage();
+    const { client: writer, epoch } = await writerOf(stageId);
+    for (let index = 0; index < 50; index++) {
+      writer.send(commit(epoch, `move-${index}`, { upserts: [wall("a", index)] }));
+      expect(await writer.expect("ack")).toMatchObject({ ok: true, revision: index + 1 });
+    }
+
+    const revisions = await runInDurableObject(env.STAGES.getByName(stageId), (_instance, state) =>
+      state.storage.sql
+        .exec<{ doc: string; rows: number }>(
+          `SELECT json_extract(d.kind, '$') AS doc, COUNT(*) AS rows FROM document_revisions r
+            JOIN documents d ON d.id = r.document_id GROUP BY d.id HAVING doc LIKE 'app.stage%'`,
+        )
+        .toArray(),
+    );
+    expect(revisions.map(({ doc }) => doc)).toContain("app.stage");
+    expect(revisions.filter(({ rows }) => rows > 33)).toEqual([]);
+
+    await evictDurableObject(env.STAGES.getByName(stageId));
+    const { welcome } = await join(stageId, "view");
+    expect(welcome.snapshot).toMatchObject({ revision: 50, items: [wall("a", 49)] });
+  });
+
   it("survives eviction of the Durable Object", async () => {
     const stageId = freshStage();
     const { client: writer, epoch } = await writerOf(stageId);

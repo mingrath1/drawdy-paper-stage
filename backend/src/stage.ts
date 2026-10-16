@@ -30,6 +30,7 @@ import {
 } from "./assets.ts";
 import {
   applyPatch,
+  checkpointEvery32,
   CommitReceipts,
   planCommit,
   referencedAssets,
@@ -74,6 +75,7 @@ const ControlDoc = defineDoc<ControlState>({
   version: 1,
   scope: "session",
   initial: () => ({ tokenHash: null, writer: { connectionId: null, epoch: 0 }, assets: {} }),
+  checkpointWhen: checkpointEvery32,
 });
 
 type Member =

@@ -1,4 +1,4 @@
-import { defineDoc, defineDocFamily } from "@earendil-works/pi-durable";
+import { type CheckpointInfo, defineDoc, defineDocFamily } from "@earendil-works/pi-durable";
 import {
   type AssetHash,
   type ClientMessage,
@@ -17,11 +17,19 @@ export type SceneState = {
   items: Record<ElementId, StageItem>;
 };
 
+/**
+ * Stores a full copy instead of a delta every 32 changes. A load replays only the deltas after the newest copy, and
+ * pi-durable deletes the older revisions of a session document when it stores a copy.
+ */
+export const checkpointEvery32 = (_value: unknown, _ops: unknown, info: CheckpointInfo): boolean =>
+  info.deltasSinceBase >= 32;
+
 export const SceneDoc = defineDoc<SceneState>({
   kind: "app.stage",
   version: 1,
   scope: "session",
   initial: () => ({ revision: 0, frame: { x: 0, y: 0, width: 0, height: 0 }, items: {} }),
+  checkpointWhen: checkpointEvery32,
 });
 
 /** The revision each applied commit produced, keyed by its requestId, so a retried commit is acked, not reapplied. */
