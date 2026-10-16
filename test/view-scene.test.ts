@@ -11,6 +11,7 @@ import {
 import { AssetCache } from "../view/assets";
 import { Bodies } from "../view/bodies";
 import { HAND_TTL_MS, Hands } from "../view/hands";
+import { Hud } from "../view/hud";
 import { StageModel } from "../view/stage";
 import { WalkControls } from "../view/walk";
 import { DirectionalLight, Mesh, Texture, Vector3, type Object3D } from "../view/vendor/three.module.js";
@@ -44,10 +45,16 @@ function fakeSurface() {
     return { element: element as unknown as HTMLElement, fire: (type: string, event: object) => listeners.get(type)?.(event) };
 }
 
+/** Listeners the view added to its window, by event type. */
+let windowListeners: Map<string, ((event: object) => void)[]>;
+
 beforeEach(() => {
+    windowListeners = new Map();
     vi.stubGlobal("document", { createElement: fakeCanvas });
     vi.stubGlobal("Path2D", class { arc() {} roundRect() {} });
-    vi.stubGlobal("addEventListener", () => {});
+    vi.stubGlobal("addEventListener", (type: string, listener: (event: object) => void) =>
+        windowListeners.set(type, [...(windowListeners.get(type) ?? []), listener]),
+    );
     vi.stubGlobal("focus", () => {});
 });
 afterEach(() => vi.unstubAllGlobals());
@@ -321,5 +328,57 @@ describe("bodies", () => {
         bodies.set(mali, frame, WALKER_TTL_MS + 2100);
         bodies.update(0.1, WALKER_TTL_MS + 2200, frame);
         expect(bodies.root.children.filter((body) => body.visible)).toHaveLength(1);
+    });
+});
+
+describe("looking around", () => {
+    const press = { pointerId: 1, clientX: 100, clientY: 100 };
+
+    it("stops turning once the button is up, even when it was released outside the view", () => {
+        const surface = fakeSurface();
+        const walk = new WalkControls(surface.element);
+        surface.fire("pointerdown", press);
+        surface.fire("pointermove", { ...press, clientX: 150, buttons: 1 });
+        const turned = walk.heading;
+        expect(turned).not.toBe(Math.PI);
+        surface.fire("pointermove", { ...press, clientX: 300, buttons: 0 });
+        surface.fire("pointermove", { ...press, clientX: 400, buttons: 0 });
+        expect(walk.heading).toBe(turned);
+    });
+
+    it("forgets a drag when the pointer leaves the view or loses capture", () => {
+        for (const ending of ["pointerleave", "lostpointercapture"]) {
+            const surface = fakeSurface();
+            const walk = new WalkControls(surface.element);
+            surface.fire("pointerdown", press);
+            surface.fire(ending, press);
+            surface.fire("pointermove", { ...press, clientX: 300, buttons: 1 });
+            expect(walk.heading, ending).toBe(Math.PI);
+        }
+    });
+});
+
+describe("the HUD", () => {
+    it("toggles the frame rate once per press of F, however long the key is held", () => {
+        vi.useFakeTimers();
+        const elements = new Map<string, { hidden: boolean; dataset: object; textContent: string }>();
+        vi.stubGlobal("document", {
+            getElementById: (id: string) => {
+                if (!elements.has(id)) elements.set(id, { hidden: true, dataset: {}, textContent: "" });
+                return elements.get(id);
+            },
+        });
+        new Hud();
+        const key = (repeat: boolean) =>
+            windowListeners.get("keydown")!.forEach((listener) => listener({ code: "KeyF", repeat }));
+        key(false);
+        expect(elements.get("fps")!.hidden).toBe(false);
+        key(true);
+        expect(elements.get("fps")!.hidden).toBe(false);
+        key(true);
+        expect(elements.get("fps")!.hidden).toBe(false);
+        key(false);
+        expect(elements.get("fps")!.hidden).toBe(true);
+        vi.useRealTimers();
     });
 });

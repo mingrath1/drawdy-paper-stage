@@ -59,14 +59,19 @@ export class WalkControls {
         });
         surface.addEventListener("pointermove", (event) => {
             if (this.drag?.pointer !== event.pointerId) return;
+            if (event.buttons === 0) {
+                this.drag = null;
+                return;
+            }
             this.look(event.clientX - this.drag.x, event.clientY - this.drag.y);
             this.drag = { pointer: event.pointerId, x: event.clientX, y: event.clientY };
         });
+        /** Pointer capture stops at the iframe's edge, so a button released outside the view sends no pointerup. */
         const release = (event: PointerEvent) => {
             if (this.drag?.pointer === event.pointerId) this.drag = null;
         };
-        surface.addEventListener("pointerup", release);
-        surface.addEventListener("pointercancel", release);
+        for (const ending of ["pointerup", "pointercancel", "pointerleave", "lostpointercapture"] as const)
+            surface.addEventListener(ending, release);
     }
 
     /**
