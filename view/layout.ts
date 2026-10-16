@@ -127,7 +127,8 @@ export function floorBounds(frame: Rect): Bounds {
 
 /**
  * Moves a walker of `radius` by `delta`, sliding along any edge it would come closer to than its radius and
- * staying on the floor. Steps stay shorter than half the radius so a fast move cannot pass through a thin wall.
+ * staying on the floor. Steps stay shorter than a quarter of the radius, and every pass keeps the walker on the floor,
+ * so a fast move can neither pass through a thin wall nor squeeze between a wall and the floor's edge.
  */
 export function moveWalker(
     from: Point,
@@ -136,19 +137,22 @@ export function moveWalker(
     bounds: Bounds,
     radius = WALKER_RADIUS_M,
 ): Point {
-    const steps = Math.max(1, Math.ceil(Math.hypot(delta.x, delta.z) / (radius / 2)));
+    const steps = Math.max(1, Math.ceil(Math.hypot(delta.x, delta.z) / (radius / 4)));
     let p = { ...from };
     for (let step = 0; step < steps; step++) {
         p = { x: p.x + delta.x / steps, z: p.z + delta.z / steps };
         for (let pass = 0; pass < 3; pass++) {
             for (const edge of edges) p = pushOut(p, edge, radius);
+            p = onFloor(p, bounds, radius);
         }
-        p = {
-            x: clamp(p.x, bounds.minX + radius, bounds.maxX - radius),
-            z: clamp(p.z, bounds.minZ + radius, bounds.maxZ - radius),
-        };
     }
     return p;
+}
+
+/** Keeps a walker's whole body on the floor, or centers it on a floor narrower than it is. */
+function onFloor(p: Point, { minX, maxX, minZ, maxZ }: Bounds, radius: number): Point {
+    const within = (value: number, min: number, max: number) => (min > max ? (min + max) / 2 : clamp(value, min, max));
+    return { x: within(p.x, minX + radius, maxX - radius), z: within(p.z, minZ + radius, maxZ - radius) };
 }
 
 function pushOut(p: Point, { a, b }: Segment, radius: number): Point {

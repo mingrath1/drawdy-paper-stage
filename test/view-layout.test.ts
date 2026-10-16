@@ -110,6 +110,19 @@ describe("walls", () => {
         expect(end.x).toBeCloseTo(-6 + WALKER_RADIUS_M, 5);
         expect(end.z).toBeCloseTo(4 - WALKER_RADIUS_M, 5);
     });
+
+    it("does not squeeze a running walker between a wall and the floor's edge through a gap narrower than itself", () => {
+        const nearEdge = wall({ x: 2200 - 40 - 12, y: 2400, width: 12, height: 200 });
+        let p = { x: 6 - WALKER_RADIUS_M, z: -1 };
+        for (let frame = 0; frame < 20; frame++) p = walk(p, { x: 0.05, z: 0.23 }, [nearEdge]);
+        expect(p.z).toBeLessThan(0);
+    });
+
+    it("stands a walker in the middle of a floor narrower than itself", () => {
+        const narrow: Rect = { x: 0, y: 0, width: 30, height: 800 };
+        const end = moveWalker({ x: 0.1, z: 0 }, { x: 1, z: 0 }, [], floorBounds(narrow));
+        expect(end.x).toBeCloseTo(0, 6);
+    });
 });
 
 describe("cutouts", () => {
