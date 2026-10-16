@@ -153,10 +153,11 @@ const isUpload = (message: WriterMessage) => message.type === "asset.put";
 
 /**
  * Writer messages on their way to the Stage object. The server drops a socket's messages past 60 a second, so the
- * outbox paces them, and resends unanswered or rate-limited ones in order under their original requestIds.
+ * outbox paces them.
  *
- * Commits carry whole items, so replaying an old commit after a newer one landed would undo the newer one. When a
- * replay cannot keep that order, `settle` asks the writer to resync instead.
+ * Commits carry whole items, and the server answers a resent requestId from its receipt without applying it again, so
+ * a resent old commit could land after a newer one and win for good. A commit that may be lost is therefore never
+ * resent: the outbox reports it lost and the writer resyncs. Uploads are content-addressed, so they are resent as is.
  */
 export class Outbox {
     private queue: WriterMessage[] = [];
@@ -182,22 +183,22 @@ export class Outbox {
     }
 
     /**
-     * Settles an ack and returns the message it answers, with `resync` set when the writer must resync. The server
-     * answers a socket in order, so anything sent before the acked message and still unanswered was dropped. Returns
-     * null for an ack this outbox no longer waits on: a second answer to a resent message, or one from before a clear.
+     * Settles an ack and returns the message it answers, with `lost` set when a commit was lost. The server answers a
+     * socket in order, so anything sent before the acked message and still unanswered was dropped. Returns null for
+     * an ack this outbox no longer waits on: a second answer to a resent upload, or one for a message it gave up on.
      */
-    settle(requestId: string, limited: boolean): { message: WriterMessage; resync: boolean } | null {
+    settle(requestId: string, limited: boolean): { message: WriterMessage; lost: boolean } | null {
         const index = this.inFlight.findIndex((entry) => entry.message.requestId === requestId);
         if (index < 0) return null;
         const dropped = this.inFlight.splice(0, index).map((entry) => entry.message);
         const answered = this.inFlight.shift()!.message;
-        let resync = dropped.some(isCommit);
+        let lost = dropped.some(isCommit);
         const replay: WriterMessage[] = dropped.filter(isUpload);
         if (limited) {
             const later = this.inFlight.splice(0).map((entry) => entry.message);
             if (isUpload(answered) || !later.some(isCommit)) replay.push(answered, ...later);
             else {
-                resync = true;
+                lost = true;
                 replay.push(...[answered, ...later].filter(isUpload));
             }
             const backoff = LIMIT_BACKOFF_MS[Math.min(this.limits++, LIMIT_BACKOFF_MS.length - 1)];
@@ -206,16 +207,26 @@ export class Outbox {
             this.limits = 0;
         }
         this.queue.unshift(...replay);
-        return { message: answered, resync };
+        return { message: answered, lost };
     }
 
-    /** Once the oldest unanswered message has waited too long, puts every unanswered message back at the front. */
-    retryStale(): boolean {
+    /**
+     * Once the oldest unanswered message has waited too long, gives up on every unanswered one: uploads go back to the
+     * front of the queue and commits are dropped. Returns null while nothing has expired.
+     */
+    expire(): { lost: boolean } | null {
         const oldest = this.inFlight[0];
-        if (!oldest || this.now() - oldest.sentAt < ACK_TIMEOUT_MS) return false;
-        this.queue.unshift(...this.inFlight.map((entry) => entry.message));
+        if (!oldest || this.now() - oldest.sentAt < ACK_TIMEOUT_MS) return null;
+        const unanswered = this.inFlight.map((entry) => entry.message);
         this.inFlight = [];
-        return true;
+        this.queue.unshift(...unanswered.filter(isUpload));
+        return { lost: unanswered.some(isCommit) };
+    }
+
+    /** Drops every commit not yet answered. Uploads stay, since the writer already counts them as stored. */
+    dropCommits(): void {
+        this.queue = this.queue.filter(isUpload);
+        this.inFlight = this.inFlight.filter((entry) => isUpload(entry.message));
     }
 
     clear(): void {
@@ -228,7 +239,7 @@ export class Outbox {
 export type RelayHandlers = {
     /** The first `welcome` on this relay. The stage token is registered from here on. */
     welcomed(): void;
-    /** This driver became the writer, or a rejected commit needs a full resync. */
+    /** This driver became the writer. */
     syncNeeded(): void;
     walker(walker: Walker): void;
     walkerLeft(connectionId: string): void;
@@ -262,6 +273,8 @@ export class Relay {
     private lastPing = 0;
     private stopped = false;
     private storedAssets = new Set<AssetHash>();
+    /** The newest board this writer was asked to commit, which a resync replaces the stored stage with. */
+    private desired: DesiredStage | null = null;
 
     constructor(
         private readonly backendUrl: string,
@@ -289,7 +302,17 @@ export class Relay {
     /** Sends what changed on the board, if this connection is still the writer for `epoch`. */
     commit(epoch: number, desired: DesiredStage): void {
         if (epoch !== this.writerEpoch) return;
+        this.desired = desired;
         this.outbox.push(this.session.plan(epoch, desired));
+        this.pump();
+    }
+
+    /** A commit may be lost, so the commits behind it build on a stage that may not exist. Replace the whole stage. */
+    private resync(): void {
+        this.outbox.dropCommits();
+        this.session.resync();
+        const epoch = this.writerEpoch;
+        if (epoch !== null && this.desired) this.outbox.push(this.session.plan(epoch, this.desired));
         this.pump();
     }
 
@@ -375,13 +398,12 @@ export class Relay {
                 const settled = this.outbox.settle(message.requestId, limited);
                 // A late answer can carry a stale_epoch from before a re-election; it says nothing about now.
                 if (!settled || settled.message.epoch !== this.session.epoch) return;
-                if (settled.resync) {
-                    this.session.resync();
-                    this.handlers.syncNeeded();
-                }
                 if (!message.ok && !limited) {
-                    if (!this.session.onRejected(message.error)) this.outbox.clear();
+                    if (this.session.onRejected(message.error)) this.outbox.dropCommits();
+                    else this.outbox.clear();
                     this.handlers.rejected(message.error, message.message);
+                } else if (settled.lost) {
+                    return this.resync();
                 }
                 this.pump();
                 return;
@@ -427,7 +449,9 @@ export class Relay {
             this.lastPing = now;
             this.send({ type: "ping", t: now });
         }
-        if (this.outbox.retryStale()) this.pump();
+        const expired = this.outbox.expire();
+        if (expired?.lost) this.resync();
+        else if (expired) this.pump();
     }
 
     private drop(): void {
