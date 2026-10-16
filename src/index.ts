@@ -10,7 +10,7 @@ import {
     type StageItem,
 } from "../shared/protocol";
 import { BACKEND_URL } from "./config";
-import { captureCutout, CutoutCache, exportBounds, turnedBox, type CutoutAsset } from "./cutouts";
+import { captureCutout, contentHash, CutoutCache, exportBounds, meets, turnedBox, type CutoutAsset } from "./cutouts";
 import { Host, type CommandType, type RequestArgs } from "./host";
 import { cursorsOf, participantOf, throttle } from "./presence";
 import { Relay } from "./relay";
@@ -269,12 +269,34 @@ const boardBoxes = (scene: SceneState): Rect[] =>
         return rect ? [turnedBox(rect, element.rotation ?? 0)] : [];
     });
 
-/** What a capture of a cutout depends on: where it sits, how it looks, and the box Drawdy exports around it. */
-const captureKey = (item: BoardItem | null, board: readonly Rect[]): string | null =>
-    item?.kind === "cutout" ? JSON.stringify([item.rect, item.contentHash, exportBounds(item.rect, board)]) : null;
+type CutoutBoardItem = Extract<BoardItem, { kind: "cutout" }>;
+
+/**
+ * What a cutout's picture shows: its own drawing, and where every other element drawn into its capture area sits and
+ * how it looks. The stage frame is left out, since its background is cut away.
+ */
+const pictureKey = (scene: SceneState, item: CutoutBoardItem): string =>
+    JSON.stringify([
+        item.contentHash,
+        [...scene.elements.values()]
+            .flatMap((element) => {
+                const rect = rectOf(element);
+                if (!rect || element.id === item.id || element.id === scene.frameId) return [];
+                if (!meets(turnedBox(rect, element.rotation ?? 0), item.rect)) return [];
+                return [[element.id, Math.round(rect.x), Math.round(rect.y), contentHash(element)]];
+            })
+            .sort(),
+    ]);
+
+/** What a capture of a cutout depends on: its picture, where it sits, and the box Drawdy exports around it. */
+const captureKey = (scene: SceneState, item: BoardItem | null): string | null =>
+    item?.kind === "cutout"
+        ? JSON.stringify([item.rect, pictureKey(scene, item), exportBounds(item.rect, boardBoxes(scene))])
+        : null;
 
 async function flush(stage: Stage): Promise<void> {
-    const projection = projectStage(stage.scene);
+    const scene = stage.scene;
+    const projection = projectStage(scene);
     if (!projection) return closeStage(stage);
     noteDropped(stage, projection.dropped);
     const epoch = stage.relay.writerEpoch;
@@ -282,7 +304,7 @@ async function flush(stage: Stage): Promise<void> {
 
     const items = new Map<ElementId, StageItem>();
     const assets = new Map<AssetHash, CutoutAsset>();
-    const board = boardBoxes(stage.scene);
+    const board = boardBoxes(scene);
     let tooBig = 0;
     let retryInMs = Infinity;
     for (const item of projection.items) {
@@ -290,20 +312,21 @@ async function flush(stage: Stage): Promise<void> {
             items.set(item.id, item);
             continue;
         }
-        let result = stage.cutouts.get(item.id, item.contentHash);
+        const picture = pictureKey(scene, item);
+        let result = stage.cutouts.get(item.id, picture);
         if (!result) {
-            const key = captureKey(item, board);
+            const key = captureKey(scene, item);
             const captured = await captureCutout(host, item.rect, board);
             // A capture that finishes after the writer changed belongs to an older epoch.
             if (stage.relay.writerEpoch !== epoch) return;
             // Drawdy exports the board as it is when it runs the command. If the cutout or what gets exported with it
             // changed since this flush began, the pixels may match neither, so they are dropped and captured again.
-            if (captureKey(stageItemOf(stage.scene, item.id), boardBoxes(stage.scene)) !== key) {
+            if (captureKey(stage.scene, stageItemOf(stage.scene, item.id)) !== key) {
                 scheduleFlush();
                 continue;
             }
-            stage.cutouts.set(item.id, item.contentHash, captured);
-            result = stage.cutouts.get(item.id, item.contentHash)!;
+            stage.cutouts.set(item.id, picture, captured);
+            result = stage.cutouts.get(item.id, picture)!;
         }
         if ("retryInMs" in result) {
             retryInMs = Math.min(retryInMs, result.retryInMs);

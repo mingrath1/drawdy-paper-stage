@@ -244,6 +244,52 @@ describe("the driver against a fake Drawdy", () => {
         expect(writes(socket).at(-1)).toMatchObject({ type: "scene.commit", upserts: [{ id: "d", rect: moved }] });
     });
 
+    it("captures a cutout again when a drawing overlapping its picture moves or changes", async () => {
+        const fake = new FakeDrawdy([frame, doodle("d", 100, 100), doodle("n", 125, 110)]);
+        const { moveElement } = await startDriver(fake);
+        await vi.advanceTimersByTimeAsync(500);
+        const area = captureArea(rectOf(doodle("d", 100, 100))!, 0);
+        const capturesOfD = () =>
+            fake
+                .sent("command:scene:capture-screenshot")
+                .filter((r) => JSON.stringify(r.req.area) === JSON.stringify(area));
+        expect(capturesOfD()).toHaveLength(1);
+        moveElement(doodle("n", 130, 112));
+        await vi.advanceTimersByTimeAsync(500);
+        expect(capturesOfD()).toHaveLength(2);
+        moveElement({ ...doodle("n", 130, 112), strokeColor: "#e03131" });
+        await vi.advanceTimersByTimeAsync(500);
+        expect(capturesOfD()).toHaveLength(3);
+    });
+
+    it("throws away a capture taken while an overlapping drawing moved, and captures it again", async () => {
+        const fake = new FakeDrawdy([frame, doodle("d", 100, 100), doodle("n", 125, 110)]);
+        const area = captureArea(rectOf(doodle("d", 100, 100))!, 0);
+        const { moveElement } = await startDriver(fake);
+        fake.duringCapture = () => {
+            fake.duringCapture = () => {};
+            moveElement(doodle("n", 130, 112));
+        };
+        await vi.advanceTimersByTimeAsync(1_000);
+        const capturesOfD = fake
+            .sent("command:scene:capture-screenshot")
+            .filter((r) => JSON.stringify(r.req.area) === JSON.stringify(area));
+        expect(capturesOfD).toHaveLength(2);
+    });
+
+    it("keeps a cutout's picture while it is dragged around inside a room", async () => {
+        const room = { ...doodle("room", 50, 50), type: "path", componentType: "rect", width: 400, height: 300 };
+        const fake = new FakeDrawdy([frame, room as SubscribedDrawdyElement, doodle("d", 100, 100)]);
+        const { socket, moveElement } = await startDriver(fake);
+        await vi.advanceTimersByTimeAsync(500);
+        for (let step = 1; step <= 5; step++) {
+            moveElement(doodle("d", 100 + step * 20, 100 + step * 10));
+            await vi.advanceTimersByTimeAsync(200);
+        }
+        expect(fake.sent("command:scene:capture-screenshot")).toHaveLength(1);
+        expect(writes(socket).at(-1)).toMatchObject({ type: "scene.commit", upserts: [{ id: "d" }] });
+    });
+
     it("retries a failed capture on its own, without waiting for the drawing to change", async () => {
         const fake = new FakeDrawdy([frame, doodle("d", 100, 100)]);
         fake.failCaptures = 1;

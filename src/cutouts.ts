@@ -59,7 +59,7 @@ export function captureArea(rect: Rect, rotation: number): Rect {
     };
 }
 
-const meets = (a: Rect, b: Rect) =>
+export const meets = (a: Rect, b: Rect) =>
     a.x <= b.x + b.width && b.x <= a.x + a.width && a.y <= b.y + b.height && b.y <= a.y + a.height;
 
 /**
