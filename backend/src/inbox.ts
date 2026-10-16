@@ -4,7 +4,7 @@ type Rate = { readonly perSecond: number; readonly burst: number };
 
 const MEMBER_RATE: Rate = { perSecond: 60, burst: 60 };
 /** Room for the writer to upload every cutout of a full stage and commit it in one burst. */
-const WRITER_RATE: Rate = { perSecond: 150, burst: 150 };
+export const WRITER_RATE: Rate = { perSecond: 150, burst: 150 };
 /** Lets a few poses or cursor lists that the network delivers together through without raising the sustained rate. */
 const POSE_RATE: Rate = { perSecond: POSE_HZ, burst: 5 };
 const CURSOR_RATE: Rate = { perSecond: CURSOR_HZ, burst: 5 };

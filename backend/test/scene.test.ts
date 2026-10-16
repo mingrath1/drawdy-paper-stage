@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { WRITER_RATE } from "../src/inbox.ts";
 import type { StageItem } from "../../shared/protocol.ts";
 import {
   applyPatch,
@@ -98,6 +99,15 @@ it("refuses element ids that reach the prototype chain", () => {
     ok: false,
     error: "bad_message",
   });
+});
+
+it("remembers every commit a writer can send in 10 s at its top rate", () => {
+  const state = { receipts: [] as CommitReceipt[] };
+  const tenSeconds = WRITER_RATE.burst + WRITER_RATE.perSecond * 10;
+  for (let index = 0; index < tenSeconds; index++) {
+    remember(state, { epoch: 1, requestId: `r${index}`, digest: "d", revision: index });
+  }
+  expect(findReceipt(state, 1, "r0")).toMatchObject({ revision: 0 });
 });
 
 it("keeps only the newest MAX_RECEIPTS commit receipts", () => {

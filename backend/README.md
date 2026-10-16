@@ -15,7 +15,7 @@ The wire protocol is `../shared/protocol.ts`.
 - `app.stage` holds the frame, the items keyed by element id, and the revision.
 - `app.stage-control` holds the SHA-256 of the stage token, the elected writer and its epoch, and the index of stored PNGs.
 - `app.stage-asset` holds one PNG per hash. The store keeps up to twice `MAX_CUTOUTS_PER_STAGE` and evicts the oldest PNG no item references.
-- `app.stage-commit-receipts` holds the newest 256 accepted commits, each keyed by writer epoch and requestId with a digest of its payload. A resend of the same commit gets its first ack. A reused requestId with another payload gets `bad_message`.
+- `app.stage-commit-receipts` holds the newest 2048 accepted commits, 10 s at the writer's top rate, each keyed by writer epoch and requestId with a digest of its payload. A resend of the same commit gets its first ack. A reused requestId with another payload gets `bad_message`.
 
 The scene, control, and receipts documents store a full copy every 32 changes, so a load replays at most 32 deltas. A commit that changes nothing keeps the revision and sends no patch.
 

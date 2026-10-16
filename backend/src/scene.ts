@@ -36,8 +36,8 @@ export const SceneDoc = defineDoc<SceneState>({
 export type CommitReceipt = { epoch: number; requestId: string; digest: string; revision: number };
 export type ReceiptsState = { receipts: CommitReceipt[] };
 
-/** A driver resends what goes unanswered for 5 s, and sends far fewer commits than this in that time. */
-export const MAX_RECEIPTS = 256;
+/** Covers 10 s of commits at the writer's top rate of 150 frames a second, twice a driver's 5 s ack timeout. */
+export const MAX_RECEIPTS = 2048;
 
 export const CommitReceipts = defineDoc<ReceiptsState>({
   kind: "app.stage-commit-receipts",
