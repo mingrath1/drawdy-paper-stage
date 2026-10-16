@@ -272,4 +272,24 @@ describe("the driver against a fake Drawdy", () => {
             { type: "cursors", epoch: 1, cursors: [{ presenceId: "friend", name: "Ploy", color: "#0ca678", x: 5, y: 6 }] },
         ]);
     });
+
+    it("refits the open view to a resized window once resizing settles, keeping the same page", async () => {
+        const fake = new FakeDrawdy([frame]);
+        const { emit } = await startDriver(fake);
+        await vi.advanceTimersByTimeAsync(0);
+        const views = () =>
+            fake.sent("command:dom:upsert-floating-element").filter((r) => r.req.domId === "paper-stage-view");
+        expect(views()).toHaveLength(1);
+        for (const width of [1100, 1200, 1300]) {
+            await emit({ type: "subscription:dom:screen-resized", body: { width, height: 900 } });
+            await vi.advanceTimersByTimeAsync(50);
+        }
+        expect(views()).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(500);
+        const [opened, refit] = views();
+        expect(views()).toHaveLength(2);
+        expect(refit.req.position).toEqual({ x: 130, y: 90 });
+        expect(refit.req.schema.styles).toMatchObject({ width: [1040, "px"], height: [720, "px"] });
+        expect(findIframe(refit.req.schema)).toEqual(findIframe(opened.req.schema));
+    });
 });

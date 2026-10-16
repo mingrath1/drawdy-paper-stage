@@ -36,6 +36,8 @@ const STARTER_COLORS = { ink: "#1e1e1e", wall: "#e8dcc4", pawn: "#e8590c" };
 /** At most 10 commits per second while things move; each commit is persisted. */
 const FLUSH_MS = 100;
 const RETRY_MS = 2_000;
+/** A window drag fires many resizes; the view is refitted once they stop. */
+const RESIZE_SETTLE_MS = 200;
 const WELCOME_WAIT_MS = 8_000;
 const SCENE_TOPICS = [
     "subscription:scene:elements-added",
@@ -52,6 +54,7 @@ type Stage = {
     rest: RestWatch;
     cutouts: CutoutCache;
     sendCursors: (users: readonly CollaborationUserPresence[]) => void;
+    viewHtml: string;
     viewWanted: boolean;
     viewOpen: boolean;
     dropped: { cutouts: number; items: number; tooBig: number };
@@ -94,12 +97,7 @@ export const onEvent: DriverModule["onEvent"] = async (event) => {
             if (state.phase === "running") state.stage.sendCursors(event.body.users);
             return;
         case "subscription:dom:screen-resized":
-            if (state.phase === "running" && state.stage.viewOpen) {
-                await host.run("command:dom:move-floating-element", {
-                    domId: VIEW_ID,
-                    position: viewLayout(event.body).position,
-                });
-            }
+            if (state.phase === "running") onResize(state.stage, event.body);
             return;
     }
 };
@@ -187,6 +185,12 @@ async function openStage(): Promise<Stage | null> {
         sendCursors: throttle(1000 / CURSOR_HZ, (users: readonly CollaborationUserPresence[]) =>
             stage.relay.sendCursors(cursorsOf(users)),
         ),
+        viewHtml: buildViewHtml({
+            backendUrl: BACKEND_URL,
+            stageId: frame.meta.stageId,
+            token: frame.meta.token,
+            participant,
+        }),
         viewWanted: true,
         viewOpen: false,
         dropped: { cutouts: 0, items: 0, tooBig: 0 },
@@ -368,11 +372,25 @@ function setViewWanted(stage: Stage, wanted: boolean): void {
 
 let viewQueue = Promise.resolve();
 
+function queueView(task: () => Promise<void>): void {
+    viewQueue = viewQueue.then(task).catch((err: unknown) => console.error("[paper-stage] view failed", err));
+}
+
 /** Opens or closes the 3D view to match intent: open only when wanted and after the relay's first welcome. */
 function syncView(stage: Stage): void {
-    viewQueue = viewQueue
-        .then(() => applyView(stage))
-        .catch((err: unknown) => console.error("[paper-stage] view failed", err));
+    queueView(() => applyView(stage));
+}
+
+let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+
+function onResize(stage: Stage, window: { width: number; height: number }): void {
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+        resizeTimer = null;
+        queueView(async () => {
+            if (stage.viewOpen) await placeView(stage, window);
+        });
+    }, RESIZE_SETTLE_MS);
 }
 
 async function applyView(stage: Stage): Promise<void> {
@@ -384,7 +402,8 @@ async function applyView(stage: Stage): Promise<void> {
         stage.viewOpen = false;
         return;
     }
-    stage.viewOpen = await openView(stage);
+    const size = await host.run("command:dom:window-size");
+    stage.viewOpen = size.ok && (await placeView(stage, size.value));
     if (!stage.viewOpen) {
         stage.viewWanted = false;
         return;
@@ -393,21 +412,14 @@ async function applyView(stage: Stage): Promise<void> {
     await subscribe("subscription:dom:screen-resized");
 }
 
-async function openView(stage: Stage): Promise<boolean> {
-    const size = await host.run("command:dom:window-size");
-    if (!size.ok) return false;
-    const layout = viewLayout(size.value);
-    const boot = {
-        backendUrl: BACKEND_URL,
-        stageId: stage.meta.stageId,
-        token: stage.meta.token,
-        participant: stage.participant,
-    };
-    const opened = await host.run("command:dom:upsert-floating-element", {
+/** Shows the view sized to the window. The srcDoc is the same string every time; only size and position change. */
+async function placeView(stage: Stage, window: { width: number; height: number }): Promise<boolean> {
+    const layout = viewLayout(window);
+    const placed = await host.run("command:dom:upsert-floating-element", {
         domId: VIEW_ID,
         position: layout.position,
         asPopover: false,
-        schema: viewSchema(buildViewHtml(boot), layout, host.palette),
+        schema: viewSchema(stage.viewHtml, layout, host.palette),
     });
-    return opened.ok;
+    return placed.ok;
 }
