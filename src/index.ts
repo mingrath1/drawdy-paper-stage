@@ -7,15 +7,25 @@ import {
     type ElementId,
     type Participant,
     type Pose,
+    type Rect,
     type StageItem,
 } from "../shared/protocol";
 import { BACKEND_URL } from "./config";
-import { captureCutout, CutoutCache, turnedBox, type CutoutAsset } from "./cutouts";
+import { captureCutout, CutoutCache, exportBounds, turnedBox, type CutoutAsset } from "./cutouts";
 import { Host, type CommandType, type RequestArgs } from "./host";
 import { cursorsOf, participantOf, RestWatch, throttle } from "./presence";
 import { Relay } from "./relay";
 import { findFreeSpot, findStageFrame, newStageMeta, STAGE_SIZE, starterStage, type StageMeta } from "./stage-frame";
-import { ELEMENT_PROPERTIES, projectStage, rectOf, reduceScene, type SceneEvent, type SceneState } from "./stage-model";
+import {
+    ELEMENT_PROPERTIES,
+    projectStage,
+    rectOf,
+    reduceScene,
+    stageItemOf,
+    type BoardItem,
+    type SceneEvent,
+    type SceneState,
+} from "./stage-model";
 import { buildViewHtml } from "./view-html";
 import { CLOSE_ID, VIEW_ID, viewLayout, viewSchema } from "./view-window";
 
@@ -247,6 +257,16 @@ async function runFlush(): Promise<void> {
     }
 }
 
+const boardBoxes = (scene: SceneState): Rect[] =>
+    [...scene.elements.values()].flatMap((element) => {
+        const rect = rectOf(element);
+        return rect ? [turnedBox(rect, element.rotation ?? 0)] : [];
+    });
+
+/** What a capture of a cutout depends on: where it sits, how it looks, and the box Drawdy exports around it. */
+const captureKey = (item: BoardItem | null, board: readonly Rect[]): string | null =>
+    item?.kind === "cutout" ? JSON.stringify([item.rect, item.contentHash, exportBounds(item.rect, board)]) : null;
+
 async function flush(stage: Stage): Promise<void> {
     const projection = projectStage(stage.scene);
     if (!projection) return closeStage(stage);
@@ -256,10 +276,7 @@ async function flush(stage: Stage): Promise<void> {
 
     const items = new Map<ElementId, StageItem>();
     const assets = new Map<AssetHash, CutoutAsset>();
-    const board = [...stage.scene.elements.values()].flatMap((element) => {
-        const rect = rectOf(element);
-        return rect ? [turnedBox(rect, element.rotation ?? 0)] : [];
-    });
+    const board = boardBoxes(stage.scene);
     let tooBig = 0;
     let retryInMs = Infinity;
     for (const item of projection.items) {
@@ -269,9 +286,16 @@ async function flush(stage: Stage): Promise<void> {
         }
         let result = stage.cutouts.get(item.id, item.contentHash);
         if (!result) {
+            const key = captureKey(item, board);
             const captured = await captureCutout(host, item.rect, board);
             // A capture that finishes after the writer changed belongs to an older epoch.
             if (stage.relay.writerEpoch !== epoch) return;
+            // Drawdy exports the board as it is when it runs the command. If the cutout or what gets exported with it
+            // changed since this flush began, the pixels may match neither, so they are dropped and captured again.
+            if (captureKey(stageItemOf(stage.scene, item.id), boardBoxes(stage.scene)) !== key) {
+                scheduleFlush();
+                continue;
+            }
             stage.cutouts.set(item.id, item.contentHash, captured);
             result = stage.cutouts.get(item.id, item.contentHash)!;
         }

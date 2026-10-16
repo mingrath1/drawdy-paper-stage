@@ -224,6 +224,19 @@ describe("the driver against a fake Drawdy", () => {
         expect(writes(socket).at(-1)).toMatchObject({ type: "scene.commit", reset: true, upserts: [{ id: "d", rect: area }] });
     });
 
+    it("throws away a capture of a cutout that moved while Drawdy exported it, and captures it again", async () => {
+        const fake = new FakeDrawdy([frame, doodle("d", 100, 100)]);
+        const { socket, moveElement } = await startDriver(fake);
+        fake.duringCapture = () => {
+            fake.duringCapture = () => {};
+            moveElement(doodle("d", 400, 300));
+        };
+        await vi.advanceTimersByTimeAsync(1_000);
+        const moved = captureArea(rectOf(doodle("d", 400, 300))!, 0);
+        expect(puts(socket).map(pictureOf)).toEqual([moved]);
+        expect(writes(socket).at(-1)).toMatchObject({ type: "scene.commit", upserts: [{ id: "d", rect: moved }] });
+    });
+
     it("retries a failed capture on its own, without waiting for the drawing to change", async () => {
         const fake = new FakeDrawdy([frame, doodle("d", 100, 100)]);
         fake.failCaptures = 1;

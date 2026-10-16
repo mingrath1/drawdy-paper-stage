@@ -181,6 +181,21 @@ function toBoardItem(element: BoardElement, role: StageRole, rect: Rect): BoardI
     }
 }
 
+function memberItem(element: BoardElement, frameId: ElementId, frame: Rect): BoardItem | null {
+    const role = classify(element);
+    const rect = rectOf(element);
+    if (!role || !rect || !belongsToStage(element, frameId, frame)) return null;
+    return toBoardItem(element, role, rect);
+}
+
+/** The stage item one element stands as right now, or null when it stands as none. Ignores the caps. */
+export function stageItemOf(state: SceneState, id: ElementId): BoardItem | null {
+    const frameElement = state.elements.get(state.frameId);
+    const frame = frameElement && rectOf(frameElement);
+    const element = state.elements.get(id);
+    return frame && element ? memberItem(element, state.frameId, frame) : null;
+}
+
 /** What stands on the stage right now, or null when the stage frame is gone. */
 export function projectStage(state: SceneState): StageProjection | null {
     const frameElement = state.elements.get(state.frameId);
@@ -191,10 +206,8 @@ export function projectStage(state: SceneState): StageProjection | null {
     const walls: BoardItem[] = [];
     const cutouts: BoardItem[] = [];
     for (const element of state.elements.values()) {
-        const role = classify(element);
-        const rect = rectOf(element);
-        if (!role || !rect || !belongsToStage(element, state.frameId, frame)) continue;
-        const item = toBoardItem(element, role, rect);
+        const item = memberItem(element, state.frameId, frame);
+        if (!item) continue;
         if (item.kind === "pawn") pawn ??= item;
         else (item.kind === "wall" ? walls : cutouts).push(item);
     }
