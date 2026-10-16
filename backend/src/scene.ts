@@ -36,7 +36,7 @@ export const SceneDoc = defineDoc<SceneState>({
 export type CommitReceipt = { epoch: number; requestId: string; digest: string; revision: number };
 export type ReceiptsState = { receipts: CommitReceipt[] };
 
-/** A driver resends unanswered messages after 5 s, far fewer than this many. */
+/** A driver resends what goes unanswered for 5 s, and sends far fewer commits than this in that time. */
 export const MAX_RECEIPTS = 256;
 
 export const CommitReceipts = defineDoc<ReceiptsState>({
