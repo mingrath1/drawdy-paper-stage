@@ -112,7 +112,8 @@ export class WriterSession {
     }
 
     /** Called on a rejected ack. Returns true when a full resync could repair it. */
-    onRejected(error: AckError): boolean {
+    onRejected(error: AckError, rejected: WriterMessage): boolean {
+        if (rejected.type === "asset.put") this.uploaded.delete(rejected.hash);
         if (error === "not_writer" || error === "stale_epoch") {
             this.epoch = null;
             return false;
@@ -405,7 +406,9 @@ export class Relay {
                 // A late answer can carry a stale_epoch from before a re-election; it says nothing about now.
                 if (!settled || settled.message.epoch !== this.session.epoch) return;
                 if (!message.ok) {
-                    if (this.session.onRejected(message.error)) this.outbox.dropCommits();
+                    // A put refused over the message budget goes again with the next plan, once the budget refilled.
+                    if (message.error === "limit" && settled.message.type === "asset.put") this.outbox.throttle();
+                    if (this.session.onRejected(message.error, settled.message)) this.outbox.dropCommits();
                     else this.outbox.clear();
                     this.handlers.rejected(message.error, message.message);
                 } else if (settled.lost) {

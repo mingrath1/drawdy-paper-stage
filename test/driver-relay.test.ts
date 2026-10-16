@@ -240,8 +240,9 @@ describe("WriterSession", () => {
         const a = cutout("a", "h1");
         const session = new WriterSession();
         session.onWriter(writer("me", 1), "me", new Set());
-        expect(session.plan(1, desired([a.item], [a.asset])).map((m) => m.type)).toEqual(["asset.put", "scene.commit"]);
-        expect(session.onRejected("missing_asset")).toBe(true);
+        const sent = session.plan(1, desired([a.item], [a.asset]));
+        expect(sent.map((m) => m.type)).toEqual(["asset.put", "scene.commit"]);
+        expect(session.onRejected("missing_asset", sent[1])).toBe(true);
         const retry = session.plan(1, desired([a.item], [a.asset]));
         expect(retry.map((m) => m.type)).toEqual(["asset.put", "scene.commit"]);
         expect(retry[1]).toMatchObject({ reset: true });
@@ -250,7 +251,8 @@ describe("WriterSession", () => {
     it("stops writing after a stale epoch", () => {
         const session = new WriterSession();
         session.onWriter(writer("me", 1), "me", new Set());
-        expect(session.onRejected("stale_epoch")).toBe(false);
+        const [sent] = session.plan(1, desired([wall("w")]));
+        expect(session.onRejected("stale_epoch", sent)).toBe(false);
         expect(session.epoch).toBeNull();
     });
 });
@@ -619,6 +621,40 @@ describe("Relay", () => {
         relay.commit(1, desired([wall("w")]));
         vi.advanceTimersByTime(SEND_GAP_MS);
         expect(sentCommits(socket).slice(1)).toMatchObject([{ reset: true, upserts: [wall("w")] }]);
+    });
+
+    it("uploads a picture again, after a second's pause, when the server refused it over the budget", () => {
+        const { relay, socket } = connect();
+        elect(socket);
+        const shot = cutout("c", "h1");
+        relay.commit(1, desired([shot.item], [shot.asset]));
+        const [put] = socket.sent.filter((m) => m.type === "asset.put");
+        socket.receive({ type: "ack", requestId: put.requestId, ok: false, error: "limit", message: "over budget" });
+        relay.commit(1, desired([shot.item], [shot.asset]));
+        const sentAfter = socket.sent.length;
+        vi.advanceTimersByTime(1_000 - 1);
+        expect(socket.sent).toHaveLength(sentAfter);
+        vi.advanceTimersByTime(1 + SEND_GAP_MS);
+        expect(socket.sent.slice(sentAfter)).toMatchObject([
+            { type: "asset.put", hash: "h1" },
+            { type: "scene.commit", reset: true, upserts: [shot.item] },
+        ]);
+    });
+
+    it("uploads a picture again before the next commit when the server rejected it for any reason", () => {
+        const { relay, socket } = connect();
+        elect(socket);
+        const shot = cutout("c", "h1");
+        relay.commit(1, desired([shot.item], [shot.asset]));
+        const [put] = socket.sent.filter((m) => m.type === "asset.put");
+        socket.receive({ type: "ack", requestId: put.requestId, ok: false, error: "bad_message", message: "bad png" });
+        const sentAfter = socket.sent.length;
+        relay.commit(1, desired([shot.item], [shot.asset]));
+        vi.advanceTimersByTime(SEND_GAP_MS * 2);
+        expect(socket.sent.slice(sentAfter)).toMatchObject([
+            { type: "asset.put", hash: "h1" },
+            { type: "scene.commit", reset: true, upserts: [shot.item] },
+        ]);
     });
 
     it("pauses for a second when the server says it is dropping this socket's messages", () => {
