@@ -109,13 +109,17 @@ const link = new StageLink(
     },
 );
 
-function resize(): void {
-    renderer.setSize(innerWidth, innerHeight, false);
-    camera.aspect = innerWidth / Math.max(1, innerHeight);
+let drawn = { width: -1, height: -1 };
+
+/** Sizes the drawing buffer to the canvas's box. A floating iframe can mount at 0x0 and grow with no resize event. */
+function fitCanvas(): void {
+    const { clientWidth: width, clientHeight: height } = canvas;
+    if (width === drawn.width && height === drawn.height) return;
+    drawn = { width, height };
+    renderer.setSize(width, height, false);
+    camera.aspect = width / Math.max(1, height);
     camera.updateProjectionMatrix();
 }
-addEventListener("resize", resize);
-resize();
 
 /** Read by verification scripts: the last whole second's frame rate and what was on stage. */
 const stats = { fps: 0, walls: 0, cutouts: 0, drawCalls: 0 };
@@ -126,6 +130,7 @@ let windowStart = performance.now();
 let last = windowStart;
 
 renderer.setAnimationLoop(() => {
+    fitCanvas();
     const now = performance.now();
     const dt = Math.min((now - last) / 1000, 0.05);
     last = now;
