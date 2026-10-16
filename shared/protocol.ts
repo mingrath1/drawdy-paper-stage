@@ -64,7 +64,8 @@ export type StageItem =
           rect: Rect;
           asset: AssetRef;
           /**
-           * Milestone 2. Server-owned: the Stage object sets it, and a writer commit that omits it keeps the stored value.
+           * Milestone 2. Server-owned: the Stage object sets it, and a writer commit keeps the stored value while the
+           * cutout's asset hash stays the same.
            */
           meshUrl?: string;
       }

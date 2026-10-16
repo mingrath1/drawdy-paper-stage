@@ -12,7 +12,11 @@ import {
 } from "../src/scene.ts";
 
 const asset = { hash: "a".repeat(64), width: 10, height: 10 };
-const assets = { [asset.hash]: { width: 10, height: 10 } };
+const redrawnAsset = { hash: "b".repeat(64), width: 10, height: 10 };
+const assets = {
+  [asset.hash]: { width: 10, height: 10 },
+  [redrawnAsset.hash]: { width: 10, height: 10 },
+};
 const doodle = (meshUrl?: string): StageItem => ({
   kind: "cutout",
   id: "doodle",
@@ -55,6 +59,13 @@ describe("meshUrl is server-owned", () => {
     expect(
       applied(sceneWith(doodle(stored)), commit({ reset: true, upserts: [doodle()] })).items.doodle,
     ).toEqual(doodle(stored));
+  });
+
+  it("drops the stored meshUrl when the cutout's picture changes", () => {
+    const redrawn = { ...doodle(), asset: redrawnAsset };
+    expect(applied(sceneWith(doodle(stored)), commit({ upserts: [redrawn] })).items.doodle).toEqual(
+      redrawn,
+    );
   });
 
   it("ignores a meshUrl sent by the writer", () => {

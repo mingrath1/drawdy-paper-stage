@@ -96,7 +96,8 @@ export const referencedAssets = (scene: Readonly<SceneState>): Set<AssetHash> =>
 /**
  * Checks a writer's commit against the stage limits and the uploaded assets, and returns the patch that applies it,
  * or no patch when the commit would leave the scene as it is.
- * `meshUrl` is server-owned: an upserted cutout keeps the one already stored under its id and drops any it sent.
+ * `meshUrl` is server-owned: an upserted cutout drops any it sent and keeps the one stored under its id while its
+ * picture stays the same.
  */
 export function planCommit(
   scene: Readonly<SceneState>,
@@ -160,7 +161,9 @@ function changesScene(scene: Readonly<SceneState>, patch: ScenePatch): boolean {
 function withStoredMesh(item: StageItem, stored: StageItem | undefined): StageItem {
   if (item.kind !== "cutout") return item;
   const { meshUrl: _sent, ...cutout } = item;
-  return stored?.kind === "cutout" && stored.meshUrl !== undefined
+  return stored?.kind === "cutout" &&
+    stored.meshUrl !== undefined &&
+    stored.asset.hash === cutout.asset.hash
     ? { ...cutout, meshUrl: stored.meshUrl }
     : cutout;
 }
