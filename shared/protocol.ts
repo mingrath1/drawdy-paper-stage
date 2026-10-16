@@ -1,24 +1,50 @@
 // Wire protocol between the Drawdy driver, the Stage Durable Object, and the 3D view.
 // Pure TypeScript with no imports: the driver (esbuild), the view (build-view.mjs), and the backend (wrangler) all bundle it.
+//
+// Trust boundary. The stage token lives in the stage frame's meta, so anyone who can read the board can join the stage.
+// That matches Drawdy itself: anyone who can read the board can already edit it. Names and colors are self-reported
+// and unverified.
+//
+// One writer. Every collaborator runs a driver, and every driver sees the same synced board. The Stage object elects
+// one connected driver as the writer and fences it with an epoch. Only the writer commits the scene, uploads assets,
+// and relays cursors. Other drivers stay connected and take over when the writer leaves.
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 /** Canvas units per meter in the 3D view. A 300 px wide room on the board is 3 m wide inside. */
 export const CANVAS_UNITS_PER_METER = 100;
 export const WALL_HEIGHT_METERS = 2.6;
+export const EYE_HEIGHT_METERS = 1.6;
 
-export const MAX_CUTOUT_PNG_BASE64 = 350_000;
-export const MAX_CUTOUTS_PER_STAGE = 60;
+/** Cloudflare caps WebSocket messages at 1 MiB. Every frame, in either direction, stays under this. */
+export const MAX_FRAME_CHARACTERS = 900_000;
 export const MAX_ITEMS_PER_STAGE = 400;
-export const MAX_FRAME_CHARACTERS = 2_000_000;
+export const MAX_ITEMS_PER_COMMIT = 100;
+export const MAX_CUTOUTS_PER_STAGE = 60;
+/** The driver downscales captures so the longest side is at most this many pixels. */
+export const MAX_ASSET_SIDE_PX = 512;
+export const MAX_ASSET_BASE64 = 400_000;
+export const MAX_NAME_CHARS = 64;
 export const POSE_HZ = 20;
+export const CURSOR_HZ = 20;
+/** Views fade out a walker that has sent no pose for this long. */
+export const WALKER_TTL_MS = 10_000;
 
 export type ElementId = string;
 export type ConnectionId = string;
+/** SHA-256 of the PNG bytes, lowercase hex. */
+export type AssetHash = string;
 
+/**
+ * An element's own box as Drawdy reports it (`x`, `y`, `width`, `height`), in absolute canvas units.
+ * For walls this is the unrotated box; `rotation` turns it about its center.
+ * Verify against a rotated rectangle on the real board before relying on it.
+ */
 export type Rect = { x: number; y: number; width: number; height: number };
 
 export type WallShape = "rect" | "circle" | "diamond";
+
+export type AssetRef = { hash: AssetHash; width: number; height: number };
 
 /** One thing standing on the stage, keyed by the Drawdy element it came from. */
 export type StageItem =
@@ -27,23 +53,21 @@ export type StageItem =
           id: ElementId;
           rect: Rect;
           shape: WallShape;
-          /** Radians, about the rect center, as Drawdy reports it. */
+          /** Radians, clockwise on the board (y down), about the rect center. */
           rotation: number;
           color?: string;
       }
     | {
           kind: "cutout";
           id: ElementId;
+          /** The screenshot area in canvas units. The PNG already shows the element's rotation, so cutouts carry none. */
           rect: Rect;
-          rotation: number;
-          /** PNG with white already transparent or not; the view applies the alpha key. */
-          pngBase64: string;
-          /** Content hash the driver uses to skip recapture. */
-          hash: string;
-          /** Set by the inflate agent when a mesh replaces the paper cutout. */
+          asset: AssetRef;
+          /** Milestone 2. Set when a mesh replaces the paper cutout. */
           meshUrl?: string;
       }
     | {
+          /** The board element that marks where walkers spawn and rest. Drivers move it; the view only reads it. */
           kind: "pawn";
           id: ElementId;
           x: number;
@@ -66,17 +90,16 @@ export type Participant = {
 
 export type Role = "driver" | "view";
 
-export type Pose = {
-    /** Canvas units, same space as the board. */
-    x: number;
-    y: number;
-    /** Radians. 0 faces +y on the board (down the screen). */
-    heading: number;
-    /** Radians, look up and down, clamped by the view. */
-    pitch: number;
-};
+/**
+ * Where a walker stands and looks, in canvas units.
+ * Facing direction on the board is (sin(heading), cos(heading)): heading 0 faces +y (down the screen),
+ * positive heading turns toward +x. Normalized to (-PI, PI]. Pitch is positive up, clamped to [-1.4, 1.4].
+ */
+export type Pose = { x: number; y: number; heading: number; pitch: number };
 
 export type Cursor = Participant & { x: number; y: number };
+
+export type Writer = { connectionId: ConnectionId | null; epoch: number };
 
 export type ClientMessage =
     | {
@@ -87,39 +110,53 @@ export type ClientMessage =
           role: Role;
           participant: Participant;
       }
-    /** Driver only. Replaces the whole scene, used on first open and after reconnect. */
-    | { type: "scene.reset"; requestId: string; frame: Rect; items: StageItem[] }
-    /** Driver only. */
-    | { type: "scene.upsert"; requestId: string; items: StageItem[] }
-    /** Driver only. */
-    | { type: "scene.remove"; requestId: string; ids: ElementId[] }
+    /**
+     * Writer only, fenced by epoch. Applied atomically. `reset` replaces every item first (used after the writer is
+     * elected). Cutout items may reference only assets already uploaded with `asset.put`.
+     */
+    | {
+          type: "scene.commit";
+          requestId: string;
+          epoch: number;
+          reset?: true;
+          frame?: Rect;
+          upserts: StageItem[];
+          removes: ElementId[];
+      }
+    /** Writer only. Content-addressed, so a repeat upload of the same hash is a no-op. */
+    | { type: "asset.put"; requestId: string; epoch: number; hash: AssetHash; width: number; height: number; pngBase64: string }
     /** View only. Ephemeral, broadcast to everyone else, never stored. */
     | { type: "pose"; pose: Pose }
-    /** Driver only. Ephemeral collaborator cursors in canvas units, never stored. */
-    | { type: "cursors"; cursors: Cursor[] }
-    /** Reserved for milestone 2. */
-    | { type: "inflate.request"; requestId: string; ids: ElementId[] };
+    /** Writer only. A full replacement list of other people's cursors on the board. Ephemeral. */
+    | { type: "cursors"; epoch: number; cursors: Cursor[] }
+    /** Any socket. The server answers with `pong`. */
+    | { type: "ping"; t: number };
+
+export type AckError = "not_writer" | "stale_epoch" | "limit" | "missing_asset" | "bad_message";
 
 export type ServerMessage =
     | {
           type: "welcome";
           v: typeof PROTOCOL_VERSION;
           connectionId: ConnectionId;
+          writer: Writer;
           snapshot: StageSnapshot;
           walkers: Walker[];
       }
+    | { type: "writer"; writer: Writer }
     | { type: "ack"; requestId: string; ok: true; revision: number }
-    | { type: "ack"; requestId: string; ok: false; error: string }
-    | { type: "scene.patch"; revision: number; upserts: StageItem[]; removes: ElementId[]; reset?: { frame: Rect } }
+    | { type: "ack"; requestId: string; ok: false; error: AckError; message: string }
+    /** Broadcast after every successful commit. `reset` means drop every item first. */
+    | { type: "scene.patch"; revision: number; reset?: true; frame?: Rect; upserts: StageItem[]; removes: ElementId[] }
     | { type: "walker"; walker: Walker }
     | { type: "walker.left"; connectionId: ConnectionId }
-    | { type: "cursors"; from: ConnectionId; cursors: Cursor[] }
-    | { type: "inflate.status"; id: ElementId; phase: "queued" | "name" | "generate" | "check" | "done" | "failed"; detail?: string }
+    | { type: "cursors"; cursors: Cursor[] }
+    | { type: "pong"; t: number }
     | { type: "error"; code: ErrorCode; message: string };
 
 export type Walker = { connectionId: ConnectionId; participant: Participant; pose: Pose };
 
-export type ErrorCode = "bad_message" | "bad_token" | "not_driver" | "not_view" | "too_large" | "limit" | "version";
+export type ErrorCode = "bad_message" | "bad_token" | "version" | "too_large" | "limit" | "not_writer";
 
 /** WebSocket close codes the Stage object uses. */
 export const CLOSE = {
@@ -128,6 +165,16 @@ export const CLOSE = {
     malformed: 1002,
     tooLarge: 1009,
 } as const;
+
+/** Views fetch cutout PNGs over HTTPS: GET {backendUrl}/api/stages/{stageId}/assets/{hash}?token={token}. */
+export function assetUrl(backendUrl: string, stageId: string, token: string, hash: AssetHash): string {
+    return `${backendUrl}/api/stages/${encodeURIComponent(stageId)}/assets/${hash}?token=${encodeURIComponent(token)}`;
+}
+
+/** The WebSocket endpoint for a stage. */
+export function stageSocketUrl(backendUrl: string, stageId: string): string {
+    return `${backendUrl.replace(/^http/, "ws")}/api/stages/${encodeURIComponent(stageId)}`;
+}
 
 export class ProtocolError extends Error {
     constructor(readonly code: ErrorCode, message: string) {
@@ -145,7 +192,7 @@ export function parseServerMessage(_raw: string): ServerMessage {
     throw new Error("not implemented");
 }
 
-/** Board point in canvas units to a 3D floor point in meters. The view uses x for x and canvas y for z. */
+/** Board point in canvas units to a 3D floor point in meters, centered on the frame. Canvas y maps to world z. */
 export function canvasToWorld(x: number, y: number, frame: Rect): { x: number; z: number } {
     return {
         x: (x - (frame.x + frame.width / 2)) / CANVAS_UNITS_PER_METER,
