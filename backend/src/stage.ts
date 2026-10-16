@@ -49,6 +49,11 @@ import { KeyedSerialQueue } from "./serial.ts";
 export const STAGE_ID_HEADER = "x-paper-stage-id";
 
 const RECOVERY_ALARM_DELAY_MS = 60_000;
+/** The alarm sweep closes a socket that has not said hello by then. */
+const HELLO_TIMEOUT_MS = 10_000;
+/** Also bounds the walkers a welcome lists, which keeps a welcome far under MAX_FRAME_CHARACTERS. */
+const MAX_SOCKETS_PER_STAGE = 64;
+const MAX_SOCKETS_PER_PRESENCE = 8;
 
 const reportError = (
   message: string,
@@ -94,7 +99,7 @@ type Connection = {
 
 type Joined = Connection & { readonly member: Member };
 
-/** Errors that end the connection, and the close code each uses. */
+/** Errors that end the connection, and the close code each uses unless the caller names another. */
 const CLOSE_CODES = {
   bad_message: CLOSE.malformed,
   too_large: CLOSE.tooLarge,
@@ -105,6 +110,7 @@ const CLOSE_CODES = {
 } satisfies Partial<Record<ErrorCode, number>>;
 
 type ClosingError = keyof typeof CLOSE_CODES;
+type HelloRefusal = { code: ClosingError; message: string; closeCode?: number };
 
 export type AssetRead =
   | { readonly status: "found"; readonly png: Uint8Array }
@@ -190,13 +196,20 @@ export class Stage extends DurableObject<Env> {
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
+    if (this.#openSockets().length >= MAX_SOCKETS_PER_STAGE) {
+      server.accept();
+      server.close(CLOSE.full, "the stage is full");
+      return new Response(null, { status: 101, webSocket: client });
+    }
     this.ctx.acceptWebSocket(server);
+    const connectedAt = Date.now();
     this.#setConnection(server, {
       connectionId: crypto.randomUUID(),
       stageId: request.headers.get(STAGE_ID_HEADER) ?? "",
-      connectedAt: Date.now(),
+      connectedAt,
       member: null,
     });
+    await this.#alarmBy(connectedAt + HELLO_TIMEOUT_MS);
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -212,7 +225,26 @@ export class Stage extends DurableObject<Env> {
   }
 
   override async alarm(): Promise<void> {
+    await this.#sweep();
     await this.#refreshAlarm();
+  }
+
+  /** Closes sockets that never said hello. */
+  async #sweep(): Promise<void> {
+    const now = Date.now();
+    const late = this.#openSockets().filter((socket) => {
+      const { member, connectedAt } = this.#connection(socket);
+      return member === null && now - connectedAt >= HELLO_TIMEOUT_MS;
+    });
+    // Each check waits behind the socket's own frames, so a hello that already arrived still gets its answer.
+    await Promise.all(
+      late.map((socket) =>
+        this.#socketOperations.run(socket, async () => {
+          if (this.#departed.has(socket) || this.#connection(socket).member !== null) return;
+          await this.#disconnect(socket, "bad_message", "no hello within 10 s", CLOSE.policy);
+        }),
+      ),
+    );
   }
 
   override async webSocketMessage(socket: WebSocket, frame: string | ArrayBuffer): Promise<void> {
@@ -364,23 +396,46 @@ export class Stage extends DurableObject<Env> {
       return this.#disconnect(socket, "bad_message", "hello.stageId does not match the URL");
     }
     const tokenHash = await sha256Hex(hello.token);
-    const verdict = await this.#stageOperations.run("stage", () =>
-      this.#admitToken(hello.role, tokenHash),
+    const refusal = await this.#stageOperations.run("stage", () =>
+      this.#join(socket, hello, tokenHash),
     );
-    if (verdict !== "ok") {
-      console.log(`${log} ${verdict}`);
-      const message =
-        verdict === "uninitialized"
-          ? "no driver has opened this stage yet; retry"
-          : "the token does not match this stage";
-      return this.#disconnect(socket, verdict, message);
+    console.log(`${log} ${refusal?.code ?? "ok"}`);
+    if (refusal !== undefined) {
+      return this.#disconnect(socket, refusal.code, refusal.message, refusal.closeCode);
     }
-    if (socket.readyState !== WebSocket.READY_STATE_OPEN) return;
+  }
+
+  /** The token check, the per-person cap, joining, the welcome, and the election, with no stage change between them. */
+  async #join(
+    socket: WebSocket,
+    hello: Extract<ClientMessage, { type: "hello" }>,
+    tokenHash: string,
+  ): Promise<HelloRefusal | undefined> {
+    if (socket.readyState !== WebSocket.READY_STATE_OPEN || this.#departed.has(socket)) return;
+    const verdict = await this.#admitToken(hello.role, tokenHash);
+    if (verdict === "uninitialized") {
+      return { code: verdict, message: "no driver has opened this stage yet; retry" };
+    }
+    if (verdict === "bad_token") {
+      return { code: verdict, message: "the token does not match this stage" };
+    }
+    const { presenceId } = hello.participant;
+    const sockets = this.#members().filter(
+      ([, { member }]) => member.participant.presenceId === presenceId,
+    );
+    if (sockets.length >= MAX_SOCKETS_PER_PRESENCE) {
+      return {
+        code: "limit",
+        message: `one person holds at most ${MAX_SOCKETS_PER_PRESENCE} sockets on a stage`,
+        closeCode: CLOSE.full,
+      };
+    }
 
     const member: Member =
       hello.role === "driver"
         ? { role: "driver", participant: hello.participant }
         : { role: "view", participant: hello.participant, pose: null };
+    const connection = this.#connection(socket);
     this.#setConnection(socket, { ...connection, member });
     // Joining and the welcome happen in one synchronous step, so every later patch reaches this socket after it.
     this.#send(socket, {
@@ -391,10 +446,8 @@ export class Stage extends DurableObject<Env> {
       snapshot: sceneSnapshot(this.#scene),
       walkers: this.#walkers(socket),
     });
-    console.log(`${log} ok`);
-    if (member.role === "driver") {
-      await this.#stageOperations.run("stage", () => this.#electWriter());
-    }
+    if (member.role === "driver") await this.#electWriter();
+    return undefined;
   }
 
   async #admitToken(
@@ -586,10 +639,15 @@ export class Stage extends DurableObject<Env> {
     }
   }
 
-  async #disconnect(socket: WebSocket, code: ClosingError, message: string): Promise<void> {
+  async #disconnect(
+    socket: WebSocket,
+    code: ClosingError,
+    message: string,
+    closeCode: number = CLOSE_CODES[code],
+  ): Promise<void> {
     this.#send(socket, { type: "error", code, message });
     try {
-      socket.close(CLOSE_CODES[code], code);
+      socket.close(closeCode, code);
     } catch {
       // The peer may have closed first.
     }
@@ -624,11 +682,18 @@ export class Stage extends DurableObject<Env> {
     return inbox;
   }
 
+  #openSockets(): WebSocket[] {
+    return this.ctx
+      .getWebSockets()
+      .filter(
+        (socket) => socket.readyState === WebSocket.READY_STATE_OPEN && !this.#departed.has(socket),
+      );
+  }
+
   /** Open sockets whose hello was accepted. */
   #members(): Array<[WebSocket, Joined]> {
     const members: Array<[WebSocket, Joined]> = [];
-    for (const socket of this.ctx.getWebSockets()) {
-      if (socket.readyState !== WebSocket.READY_STATE_OPEN || this.#departed.has(socket)) continue;
+    for (const socket of this.#openSockets()) {
       const connection = this.#connection(socket);
       if (connection.member !== null) members.push([socket, connection as Joined]);
     }
@@ -669,11 +734,29 @@ export class Stage extends DurableObject<Env> {
       const resumable = tasks
         .filter((task) => task.state.kind !== "blocked")
         .map((task) => task.record.id);
-      await this.#replaceAlarm(
-        resumable.length === 0 ? undefined : Date.now() + RECOVERY_ALARM_DELAY_MS,
-      );
+      const due = [
+        ...(resumable.length === 0 ? [] : [Date.now() + RECOVERY_ALARM_DELAY_MS]),
+        ...this.#sweepDeadlines(),
+      ];
+      await this.#replaceAlarm(due.length === 0 ? undefined : Math.min(...due));
       // waitForTask starts the scheduler, so persist its recovery alarm first.
       for (const taskId of resumable) this.#refreshAlarmWhenTaskSettles(taskId);
+    });
+  }
+
+  /** When the sweep has work: the hello deadline of each socket that has not said hello. */
+  #sweepDeadlines(): number[] {
+    return this.#openSockets().flatMap((socket) => {
+      const { connectedAt, member } = this.#connection(socket);
+      return member === null ? [connectedAt + HELLO_TIMEOUT_MS] : [];
+    });
+  }
+
+  /** Moves the alarm earlier when `deadline` comes before it. */
+  #alarmBy(deadline: number): Promise<void> {
+    return this.#serializeAlarmUpdate(async () => {
+      const current = await this.ctx.storage.getAlarm();
+      if (current === null || current > deadline) await this.ctx.storage.setAlarm(deadline);
     });
   }
 
