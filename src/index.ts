@@ -10,7 +10,7 @@ import {
     type StageItem,
 } from "../shared/protocol";
 import { BACKEND_URL } from "./config";
-import { captureCutout, CutoutCache, type CutoutAsset } from "./cutouts";
+import { captureCutout, CutoutCache, turnedBox, type CutoutAsset } from "./cutouts";
 import { Host, type CommandType, type RequestArgs } from "./host";
 import { cursorsOf, participantOf, RestWatch, throttle } from "./presence";
 import { Relay } from "./relay";
@@ -251,6 +251,10 @@ async function flush(stage: Stage): Promise<void> {
 
     const items = new Map<ElementId, StageItem>();
     const assets = new Map<AssetHash, CutoutAsset>();
+    const board = [...stage.scene.elements.values()].flatMap((element) => {
+        const rect = rectOf(element);
+        return rect ? [turnedBox(rect, element.rotation ?? 0)] : [];
+    });
     let tooBig = 0;
     for (const item of projection.items) {
         if (item.kind !== "cutout") {
@@ -259,7 +263,7 @@ async function flush(stage: Stage): Promise<void> {
         }
         let result = stage.cutouts.get(item.id, item.contentHash);
         if (!result) {
-            result = await captureCutout(host, item.rect);
+            result = await captureCutout(host, item.rect, board);
             // A capture that finishes after the writer changed belongs to an older epoch.
             if (stage.relay.writerEpoch !== epoch) return;
             stage.cutouts.set(item.id, item.contentHash, result);

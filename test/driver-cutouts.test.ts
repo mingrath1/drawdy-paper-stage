@@ -1,6 +1,14 @@
 import { createHash, randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { bytesToBase64, captureArea, contentHash, CutoutCache, sha256Hex } from "../src/cutouts";
+import {
+    bytesToBase64,
+    captureArea,
+    contentHash,
+    cropInExport,
+    CutoutCache,
+    exportBounds,
+    sha256Hex,
+} from "../src/cutouts";
 import type { BoardElement } from "../src/stage-model";
 
 const doodle: BoardElement = {
@@ -62,6 +70,46 @@ describe("captureArea", () => {
         expect(area.width).toBeCloseTo(28);
         expect(area.height).toBeCloseTo(48);
         expect(area.x + area.width / 2).toBeCloseTo(20);
+    });
+});
+
+// Measured on the board: an area inside the 900 by 560 stage frame came back as a 940 by 600 export of the frame.
+describe("exportBounds and cropInExport", () => {
+    const frame = { x: 125, y: -395.2, width: 900, height: 560 };
+    const rect = { x: 275, y: -59.7, width: 120, height: 40 };
+    const wall = { x: 185, y: -335.2, width: 780, height: 14 };
+    const area = captureArea(rect, 0);
+
+    it("takes the whole frame when the area lies inside it", () => {
+        expect(exportBounds(area, [frame, rect, wall])).toEqual(frame);
+    });
+
+    it("finds the area inside the padded export", () => {
+        expect(cropInExport(area, frame, { width: 940, height: 600 })).toEqual({ sx: 166, sy: 351.5, sw: 128, sh: 48 });
+    });
+
+    it("scales the crop with the export", () => {
+        expect(cropInExport(area, frame, { width: 1880, height: 1200 })).toEqual({ sx: 332, sy: 703, sw: 256, sh: 96 });
+    });
+
+    it("refuses an export whose size does not fit the bounds", () => {
+        expect(cropInExport(area, frame, { width: 940, height: 700 })).toBeNull();
+    });
+
+    it("joins every element the area touches when there is no frame", () => {
+        const sticky = { x: 460, y: 235, width: 200, height: 193 };
+        const wave = { x: 280, y: 400, width: 394, height: 80 };
+        const far = { x: 2000, y: 2000, width: 10, height: 10 };
+        expect(exportBounds(captureArea(sticky, 0), [sticky, wave, far])).toEqual({
+            x: 280,
+            y: 235,
+            width: 394,
+            height: 245,
+        });
+    });
+
+    it("has nothing to export when the area touches nothing", () => {
+        expect(exportBounds({ x: 0, y: 0, width: 10, height: 10 }, [{ x: 50, y: 50, width: 5, height: 5 }])).toBeNull();
     });
 });
 

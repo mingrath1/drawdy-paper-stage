@@ -40,19 +40,57 @@ export function contentHash(element: SubscribedDrawdyElement): string {
     );
 }
 
-export function captureArea(rect: Rect, rotation: number): Rect {
+/** The axis-aligned box of a rect turned about its center. */
+export function turnedBox(rect: Rect, rotation: number): Rect {
     const cos = Math.abs(Math.cos(rotation));
     const sin = Math.abs(Math.sin(rotation));
     const width = rect.width * cos + rect.height * sin;
     const height = rect.width * sin + rect.height * cos;
-    const cx = rect.x + rect.width / 2;
-    const cy = rect.y + rect.height / 2;
+    return { x: rect.x + (rect.width - width) / 2, y: rect.y + (rect.height - height) / 2, width, height };
+}
+
+export function captureArea(rect: Rect, rotation: number): Rect {
+    const box = turnedBox(rect, rotation);
     return {
-        x: cx - width / 2 - CAPTURE_PAD,
-        y: cy - height / 2 - CAPTURE_PAD,
-        width: width + CAPTURE_PAD * 2,
-        height: height + CAPTURE_PAD * 2,
+        x: box.x - CAPTURE_PAD,
+        y: box.y - CAPTURE_PAD,
+        width: box.width + CAPTURE_PAD * 2,
+        height: box.height + CAPTURE_PAD * 2,
     };
+}
+
+const meets = (a: Rect, b: Rect) =>
+    a.x <= b.x + b.width && b.x <= a.x + a.width && a.y <= b.y + b.height && b.y <= a.y + a.height;
+
+/**
+ * `capture-screenshot` is an export, not a crop: it renders every element whose box meets the area, and a frame
+ * counts whole. This is the canvas box of that export, from the boxes of everything on the board.
+ */
+export function exportBounds(area: Rect, boxes: readonly Rect[]): Rect | null {
+    const hit = boxes.filter((box) => meets(box, area));
+    if (hit.length === 0) return null;
+    const x = Math.min(...hit.map((box) => box.x));
+    const y = Math.min(...hit.map((box) => box.y));
+    const right = Math.max(...hit.map((box) => box.x + box.width));
+    const bottom = Math.max(...hit.map((box) => box.y + box.height));
+    return { x, y, width: right - x, height: bottom - y };
+}
+
+/** Canvas units of padding Drawdy adds around an export, measured on the board at scale 1. */
+const EXPORT_PAD = 20;
+
+export type Crop = { sx: number; sy: number; sw: number; sh: number };
+
+/** Where `area` sits in an export image of `bounds`, or null when the image size does not match the bounds. */
+export function cropInExport(area: Rect, bounds: Rect, image: { width: number; height: number }): Crop | null {
+    const scale = image.width / (bounds.width + EXPORT_PAD * 2);
+    const expectedHeight = scale * (bounds.height + EXPORT_PAD * 2);
+    if (!(scale > 0) || Math.abs(expectedHeight - image.height) > Math.max(3, image.height * 0.02)) return null;
+    const sx = Math.max(0, (area.x - bounds.x + EXPORT_PAD) * scale);
+    const sy = Math.max(0, (area.y - bounds.y + EXPORT_PAD) * scale);
+    const sw = Math.min(image.width - sx, area.width * scale);
+    const sh = Math.min(image.height - sy, area.height * scale);
+    return sw >= 1 && sh >= 1 ? { sx, sy, sw, sh } : null;
 }
 
 function cyrb53(input: string): string {
@@ -123,35 +161,43 @@ export function sha256Hex(bytes: Uint8Array): string {
     return Array.from(h, (word) => word.toString(16).padStart(8, "0")).join("");
 }
 
-async function fitPng(png: Blob, maxSide: number): Promise<{ bytes: Uint8Array; width: number; height: number }> {
-    const bitmap = await createImageBitmap(png);
+async function cropPng(
+    bitmap: ImageBitmap,
+    crop: Crop,
+    maxSide: number,
+): Promise<{ bytes: Uint8Array; width: number; height: number }> {
+    const scale = Math.min(1, maxSide / Math.max(crop.sw, crop.sh));
+    const width = Math.max(1, Math.round(crop.sw * scale));
+    const height = Math.max(1, Math.round(crop.sh * scale));
+    const canvas = new OffscreenCanvas(width, height);
+    canvas.getContext("2d")!.drawImage(bitmap, crop.sx, crop.sy, crop.sw, crop.sh, 0, 0, width, height);
+    const png = await canvas.convertToBlob({ type: "image/png" });
+    return { bytes: new Uint8Array(await png.arrayBuffer()), width, height };
+}
+
+/** Exports an area of the board and cuts it out as a PNG small enough for one `asset.put`. */
+export async function captureCutout(host: Host, area: Rect, board: readonly Rect[]): Promise<CaptureResult> {
+    const bounds = exportBounds(area, board);
+    const shot = await host.call("command:scene:capture-screenshot", { area });
+    if (!shot.ok || !bounds) return { ok: false, reason: "failed" };
+    const bitmap = await createImageBitmap(shot.value.png);
     try {
-        const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
-        if (scale === 1)
-            return { bytes: new Uint8Array(await png.arrayBuffer()), width: bitmap.width, height: bitmap.height };
-        const width = Math.max(1, Math.round(bitmap.width * scale));
-        const height = Math.max(1, Math.round(bitmap.height * scale));
-        const canvas = new OffscreenCanvas(width, height);
-        canvas.getContext("2d")!.drawImage(bitmap, 0, 0, width, height);
-        const out = await canvas.convertToBlob({ type: "image/png" });
-        return { bytes: new Uint8Array(await out.arrayBuffer()), width, height };
+        const crop = cropInExport(area, bounds, bitmap);
+        if (!crop) {
+            console.warn(`[paper-stage] export ${bitmap.width}x${bitmap.height} does not match bounds`, bounds);
+            return { ok: false, reason: "failed" };
+        }
+        for (const side of [MAX_ASSET_SIDE_PX, MAX_ASSET_SIDE_PX / 2]) {
+            const { bytes, width, height } = await cropPng(bitmap, crop, side);
+            const pngBase64 = bytesToBase64(bytes);
+            if (pngBase64.length <= MAX_ASSET_BASE64) {
+                return { ok: true, cutout: { asset: { hash: sha256Hex(bytes), width, height }, pngBase64 } };
+            }
+        }
+        return { ok: false, reason: "too_big" };
     } finally {
         bitmap.close();
     }
-}
-
-/** Screenshots an area of the board as a PNG small enough for one `asset.put`. */
-export async function captureCutout(host: Host, area: Rect): Promise<CaptureResult> {
-    const shot = await host.call("command:scene:capture-screenshot", { area });
-    if (!shot.ok) return { ok: false, reason: "failed" };
-    for (const side of [MAX_ASSET_SIDE_PX, MAX_ASSET_SIDE_PX / 2]) {
-        const { bytes, width, height } = await fitPng(shot.value.png, side);
-        const pngBase64 = bytesToBase64(bytes);
-        if (pngBase64.length <= MAX_ASSET_BASE64) {
-            return { ok: true, cutout: { asset: { hash: sha256Hex(bytes), width, height }, pngBase64 } };
-        }
-    }
-    return { ok: false, reason: "too_big" };
 }
 
 /** Captures keyed by element and content hash. A failed capture is remembered so it is not retried until the element changes. */
