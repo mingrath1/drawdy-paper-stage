@@ -1,0 +1,23 @@
+{
+    "name": "drawdy-paper-stage",
+    "version": "0.1.0",
+    "description": "Paper Stage, a Drawdy extension.",
+    "license": "UNLICENSED",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "dev": "vite",
+        "build": "node build.ts",
+        "typecheck": "tsc --noEmit"
+    },
+    "devDependencies": {
+        "@types/node": "^20",
+        "typescript": "^5",
+        "vite": "^8.2.1",
+        "@drawdy/driver-protocol": "latest",
+        "@rollup/plugin-typescript": "^12.1.2",
+        "fflate": "^0.8.2",
+        "rollup": "^4.34.0",
+        "tslib": "^2.8.1"
+    }
+}

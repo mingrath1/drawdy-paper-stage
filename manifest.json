@@ -1,0 +1,13 @@
+{
+    "driverId": "mingrath.paper-stage",
+    "driverName": "Paper Stage",
+    "driverVersion": "0.1.0",
+    "description": "Step inside the floor plan you drew. Walls rise, doodles stand up as paper cutouts, and your friends reach in as giant hands.",
+    "main": "main.js",
+    "permissions": [
+        "dom",
+        "scene",
+        "collaboration",
+        "storage"
+    ]
+}
