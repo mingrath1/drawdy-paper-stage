@@ -481,7 +481,17 @@ export class Stage extends DurableObject<Env> {
     if (writerRefusal !== undefined) {
       return this.#send(socket, { type: "ack", requestId, ...writerRefusal });
     }
-    if (Object.hasOwn(this.#control.assets, hash)) return this.#send(socket, accepted);
+    const stored = Object.hasOwn(this.#control.assets, hash)
+      ? this.#control.assets[hash]
+      : undefined;
+    if (stored !== undefined) {
+      // A repeat upload comes right before a commit that uses the asset, so it moves to the newest place.
+      await this.#updateControl((control) => {
+        delete control.assets[hash];
+        control.assets[hash] = { ...stored, storedAt: Date.now() };
+      });
+      return this.#send(socket, accepted);
+    }
     const invalid = await verifyUpload(put);
     if (invalid !== undefined) return this.#send(socket, { type: "ack", requestId, ...invalid });
     const evictions = evictionsFor(this.#control.assets, referencedAssets(this.#scene));

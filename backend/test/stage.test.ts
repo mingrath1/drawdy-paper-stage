@@ -553,6 +553,28 @@ describe("assets", () => {
     expect(await status(2)).toBe(200);
     expect(await status(capacity)).toBe(200);
   });
+
+  it("counts a repeat upload as fresh, so the commit that follows still finds it", async () => {
+    const stageId = freshStage();
+    const { client: writer, epoch } = await writerOf(stageId);
+    const capacity = 2 * MAX_CUTOUTS_PER_STAGE;
+    const assets = await Promise.all(
+      Array.from({ length: capacity + 1 }, (_, index) => png(8, 8, 5_000 + index)),
+    );
+    const upload = async (index: number) => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      writer.send(put(epoch, `p${index}-${Math.random()}`, assets[index]!));
+      expect(await writer.expect("ack")).toMatchObject({ ok: true });
+    };
+    for (let index = 0; index < capacity; index++) await upload(index);
+    await upload(0);
+    await upload(capacity);
+
+    writer.send(commit(epoch, "use-first", { upserts: [cutout("c", assets[0]!)] }));
+    expect(await writer.expect("ack")).toMatchObject({ ok: true });
+    writer.send(commit(epoch, "use-second", { upserts: [cutout("d", assets[1]!)] }));
+    expect(await writer.expect("ack")).toMatchObject({ ok: false, error: "missing_asset" });
+  });
 });
 
 describe("walkers", () => {
