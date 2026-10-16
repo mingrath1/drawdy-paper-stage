@@ -108,10 +108,13 @@ export function wallToWorld(plan: WallPlan, local: Point): Point {
     };
 }
 
-/** Every edge of the wall's footprint in world space. A walker never crosses one. */
+/**
+ * Every edge of the wall's footprint in world space. A walker never crosses one. The outline winds counterclockwise
+ * and the hole clockwise, so the winding number around a point counts the walls it stands inside.
+ */
 export function wallEdges(plan: WallPlan): Segment[] {
     const { outer, hole } = wallOutlines(plan);
-    return [outer, ...(hole ? [hole] : [])].flatMap((loop) => {
+    return [outer, ...(hole ? [hole.reverse()] : [])].flatMap((loop) => {
         const world = loop.map((p) => wallToWorld(plan, p));
         return world.map((a, i) => ({ a, b: world[(i + 1) % world.length] }));
     });
@@ -176,10 +179,22 @@ function nearestOn({ a, b }: Segment, p: Point): Point {
 const SETTLE_REACH_M = 2;
 const SETTLE_DIRECTIONS = 16;
 
+/** How many walls cover `p`, as the winding number of the edges around it. */
+function wallsUnder(p: Point, edges: Segment[]): number {
+    let winding = 0;
+    for (const { a, b } of edges) {
+        const side = (b.x - a.x) * (p.z - a.z) - (p.x - a.x) * (b.z - a.z);
+        if (a.z <= p.z && b.z > p.z && side > 0) winding++;
+        else if (a.z > p.z && b.z <= p.z && side < 0) winding--;
+    }
+    return winding;
+}
+
 /**
  * Where a walker belongs after the stage changed under it, as when a wall is drawn over it or the floor shrinks. A
- * walker on the floor and less than half inside any wall stays put, so one resting snug in a corner does not creep. A
- * stranded walker moves to the nearest clear spot within SETTLE_REACH_M, or back to `home` when there is none.
+ * walker on the floor, outside every wall and less than half its radius into one, stays put, so one resting snug in a
+ * corner does not creep. A stranded walker moves to the nearest clear spot within SETTLE_REACH_M, or back to `home`
+ * when there is none.
  */
 export function settleWalker(
     at: Point,
@@ -188,7 +203,8 @@ export function settleWalker(
     bounds: Bounds,
     radius = WALKER_RADIUS_M,
 ): Point {
-    const clearance = (p: Point) => Math.min(...edges.map((edge) => distance(p, nearestOn(edge, p))));
+    const clearance = (p: Point) =>
+        wallsUnder(p, edges) === 0 ? Math.min(...edges.map((edge) => distance(p, nearestOn(edge, p)))) : 0;
     const floored = onFloor(at, bounds, radius);
     if (distance(floored, at) < 1e-9 && clearance(at) > radius / 2) return at;
     for (let reach = 0; reach <= SETTLE_REACH_M; reach += radius / 4) {

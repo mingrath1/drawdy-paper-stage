@@ -142,7 +142,11 @@ describe("settling a walker after the stage changes", () => {
     });
 
     it("leaves a walker resting in a tight corner it walked into", () => {
-        const leaning = wall({ x: 1975, y: 2400 + 75 * Math.sqrt(3) - 6, width: 300, height: 12 }, "rect", -Math.PI / 3);
+        const leaning = wall(
+            { x: 1975, y: 2400 + 75 * Math.sqrt(3) - 6, width: 300, height: 12 },
+            "rect",
+            -Math.PI / 3,
+        );
         let p = { x: 6 - WALKER_RADIUS_M, z: 3 };
         for (let frame = 0; frame < 120; frame++) p = walk(p, { x: 0.02, z: -0.04 }, [leaning]);
         const end = settle(p, [leaning]);
@@ -155,6 +159,24 @@ describe("settling a walker after the stage changes", () => {
         expect(end.x).toBeCloseTo(1, 5);
         expect(end.z).toBeLessThanOrEqual(touching);
         expect(end.z).toBeGreaterThan(touching - WALKER_RADIUS_M / 4);
+    });
+
+    it("moves a walker standing in the middle of a thin solid wall to a spot clear of it", () => {
+        const slab = wall(centered(400, 34));
+        expect(wallPlan(slab, frame).hollow).toBe(false);
+        const end = settle({ x: 1, z: 0 }, [slab]);
+        expect(Math.abs(end.z)).toBeGreaterThanOrEqual(0.17 + WALKER_RADIUS_M - 1e-9);
+        expect(Math.hypot(end.x - 1, end.z)).toBeLessThan(1);
+    });
+
+    it("moves a walker standing where two solid walls cross", () => {
+        const end = settle({ x: 0, z: 0 }, [wall(centered(400, 34)), wall(centered(34, 400))]);
+        expect(Math.abs(end.x)).toBeGreaterThanOrEqual(0.17 + WALKER_RADIUS_M - 1e-9);
+        expect(Math.abs(end.z)).toBeGreaterThanOrEqual(0.17 + WALKER_RADIUS_M - 1e-9);
+    });
+
+    it("leaves a walker standing inside a drawn room", () => {
+        expect(settle({ x: 0.5, z: 0.5 }, [wall(centered(400, 300))])).toEqual({ x: 0.5, z: 0.5 });
     });
 
     it("brings a walker back onto a floor that shrank", () => {
