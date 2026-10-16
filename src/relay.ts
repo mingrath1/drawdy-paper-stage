@@ -120,6 +120,11 @@ export class WriterSession {
         return true;
     }
 
+    /** The stored stage no longer matches what this writer committed, so the next plan replaces it. */
+    resync(): void {
+        this.needsReset = true;
+    }
+
     plan(epoch: number, desired: DesiredStage): WriterMessage[] {
         if (epoch !== this.epoch) return [];
         const messages = planSync({
@@ -137,6 +142,86 @@ export class WriterSession {
     }
 }
 
+export const SEND_GAP_MS = 50;
+export const ACK_TIMEOUT_MS = 5_000;
+const LIMIT_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000];
+
+const isCommit = (message: WriterMessage) => message.type === "scene.commit";
+const isUpload = (message: WriterMessage) => message.type === "asset.put";
+
+/**
+ * Writer messages on their way to the Stage object. The server drops a socket's messages past 60 a second, so the
+ * outbox paces them, and resends unanswered or rate-limited ones in order under their original requestIds.
+ *
+ * Commits carry whole items, so replaying an old commit after a newer one landed would undo the newer one. When a
+ * replay cannot keep that order, `settle` asks the writer to resync instead.
+ */
+export class Outbox {
+    private queue: WriterMessage[] = [];
+    private inFlight: { message: WriterMessage; sentAt: number }[] = [];
+    private nextSendAt = 0;
+    private limits = 0;
+
+    constructor(private readonly now: () => number = Date.now) {}
+
+    push(messages: readonly WriterMessage[]): void {
+        this.queue.push(...messages);
+    }
+
+    /** The next message pacing allows, how long until it may go, or null when nothing waits. */
+    take(): { message: WriterMessage } | { waitMs: number } | null {
+        if (this.queue.length === 0) return null;
+        const now = this.now();
+        if (now < this.nextSendAt) return { waitMs: this.nextSendAt - now };
+        const message = this.queue.shift()!;
+        this.inFlight.push({ message, sentAt: now });
+        this.nextSendAt = now + SEND_GAP_MS;
+        return { message };
+    }
+
+    /**
+     * Settles an ack and returns true when the writer must resync. The server answers a socket in order, so anything
+     * sent before the acked message and still unanswered was dropped.
+     */
+    settle(requestId: string, limited: boolean): boolean {
+        const index = this.inFlight.findIndex((entry) => entry.message.requestId === requestId);
+        if (index < 0) return false;
+        const dropped = this.inFlight.splice(0, index).map((entry) => entry.message);
+        const answered = this.inFlight.shift()!.message;
+        let resync = dropped.some(isCommit);
+        const replay: WriterMessage[] = dropped.filter(isUpload);
+        if (limited) {
+            const later = this.inFlight.splice(0).map((entry) => entry.message);
+            if (isUpload(answered) || !later.some(isCommit)) replay.push(answered, ...later);
+            else {
+                resync = true;
+                replay.push(...[answered, ...later].filter(isUpload));
+            }
+            const backoff = LIMIT_BACKOFF_MS[Math.min(this.limits++, LIMIT_BACKOFF_MS.length - 1)];
+            this.nextSendAt = Math.max(this.nextSendAt, this.now() + backoff);
+        } else {
+            this.limits = 0;
+        }
+        this.queue.unshift(...replay);
+        return resync;
+    }
+
+    /** Once the oldest unanswered message has waited too long, puts every unanswered message back at the front. */
+    retryStale(): boolean {
+        const oldest = this.inFlight[0];
+        if (!oldest || this.now() - oldest.sentAt < ACK_TIMEOUT_MS) return false;
+        this.queue.unshift(...this.inFlight.map((entry) => entry.message));
+        this.inFlight = [];
+        return true;
+    }
+
+    clear(): void {
+        this.queue = [];
+        this.inFlight = [];
+        this.limits = 0;
+    }
+}
+
 export type RelayHandlers = {
     /** The first `welcome` on this relay. The stage token is registered from here on. */
     welcomed(): void;
@@ -151,8 +236,10 @@ export type RelayHandlers = {
 
 type Socket = { socket: WebSocket; connectionId: string | null };
 
-const PING_MS = 20_000;
-const SILENCE_MS = 50_000;
+const TICK_MS = 1_000;
+/** The server treats a writer silent for 30 s as gone. */
+const PING_MS = 10_000;
+const SILENCE_MS = 25_000;
 const BACKOFF_MS = [500, 1_000, 2_000, 4_000, 8_000, 15_000];
 
 function cutoutHashes(items: readonly StageItem[]): AssetHash[] {
@@ -161,12 +248,15 @@ function cutoutHashes(items: readonly StageItem[]): AssetHash[] {
 
 export class Relay {
     readonly session = new WriterSession();
+    private readonly outbox = new Outbox();
     welcomed = false;
     private current: Socket | null = null;
     private attempt = 0;
     private retryTimer: ReturnType<typeof setTimeout> | null = null;
-    private pingTimer: ReturnType<typeof setInterval> | null = null;
+    private tickTimer: ReturnType<typeof setInterval> | null = null;
+    private pumpTimer: ReturnType<typeof setTimeout> | null = null;
     private lastHeard = 0;
+    private lastPing = 0;
     private stopped = false;
     private storedAssets = new Set<AssetHash>();
 
@@ -196,12 +286,27 @@ export class Relay {
     /** Sends what changed on the board, if this connection is still the writer for `epoch`. */
     commit(epoch: number, desired: DesiredStage): void {
         if (epoch !== this.writerEpoch) return;
-        for (const message of this.session.plan(epoch, desired)) this.send(message);
+        this.outbox.push(this.session.plan(epoch, desired));
+        this.pump();
     }
 
     sendCursors(cursors: Cursor[]): void {
         const epoch = this.writerEpoch;
         if (epoch !== null) this.send({ type: "cursors", epoch, cursors });
+    }
+
+    private pump(): void {
+        if (this.pumpTimer) return;
+        for (let next = this.outbox.take(); next; next = this.outbox.take()) {
+            if ("waitMs" in next) {
+                this.pumpTimer = setTimeout(() => {
+                    this.pumpTimer = null;
+                    this.pump();
+                }, next.waitMs);
+                return;
+            }
+            this.send(next.message);
+        }
     }
 
     private send(message: ClientMessage): void {
@@ -214,7 +319,7 @@ export class Relay {
         const entry: Socket = { socket, connectionId: null };
         this.current = entry;
         socket.onopen = () => {
-            this.lastHeard = Date.now();
+            this.lastHeard = this.lastPing = Date.now();
             this.send({
                 type: "hello",
                 v: PROTOCOL_VERSION,
@@ -223,7 +328,7 @@ export class Relay {
                 role: "driver",
                 participant: this.participant,
             });
-            this.pingTimer = setInterval(() => this.keepAlive(), PING_MS);
+            this.tickTimer = setInterval(() => this.tick(), TICK_MS);
         };
         socket.onmessage = (event) => {
             if (this.current !== entry) return;
@@ -262,12 +367,19 @@ export class Relay {
             case "writer":
                 this.applyWriter(entry, message.writer);
                 return;
-            case "ack":
-                if (!message.ok) {
-                    this.handlers.rejected(message.error, message.message);
-                    if (this.session.onRejected(message.error)) this.handlers.syncNeeded();
+            case "ack": {
+                const limited = !message.ok && message.error === "limit";
+                if (this.outbox.settle(message.requestId, limited)) {
+                    this.session.resync();
+                    this.handlers.syncNeeded();
                 }
+                if (!message.ok && !limited) {
+                    if (!this.session.onRejected(message.error)) this.outbox.clear();
+                    this.handlers.rejected(message.error, message.message);
+                }
+                this.pump();
                 return;
+            }
             case "scene.patch":
                 if (message.reset) this.storedAssets.clear();
                 for (const hash of cutoutHashes(message.upserts)) this.storedAssets.add(hash);
@@ -293,20 +405,30 @@ export class Relay {
 
     private applyWriter(entry: Socket, writer: Writer): void {
         if (!entry.connectionId) return;
-        if (this.session.onWriter(writer, entry.connectionId, this.storedAssets)) this.handlers.syncNeeded();
+        const epoch = this.session.epoch;
+        const becameWriter = this.session.onWriter(writer, entry.connectionId, this.storedAssets);
+        if (this.session.epoch !== epoch) this.outbox.clear();
+        if (becameWriter) this.handlers.syncNeeded();
     }
 
-    private keepAlive(): void {
-        if (Date.now() - this.lastHeard > SILENCE_MS) {
+    private tick(): void {
+        const now = Date.now();
+        if (now - this.lastHeard > SILENCE_MS) {
             this.current?.socket.close();
             return;
         }
-        this.send({ type: "ping", t: Date.now() });
+        if (now - this.lastPing >= PING_MS) {
+            this.lastPing = now;
+            this.send({ type: "ping", t: now });
+        }
+        if (this.outbox.retryStale()) this.pump();
     }
 
     private drop(): void {
-        if (this.pingTimer) clearInterval(this.pingTimer);
-        this.pingTimer = null;
+        if (this.tickTimer) clearInterval(this.tickTimer);
+        if (this.pumpTimer) clearTimeout(this.pumpTimer);
+        this.tickTimer = this.pumpTimer = null;
+        this.outbox.clear();
         const entry = this.current;
         this.current = null;
         this.session.epoch = null;

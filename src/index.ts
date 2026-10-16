@@ -160,10 +160,6 @@ async function openStage(): Promise<Stage | null> {
             walkerLeft: (connectionId) => stage.rest.left(connectionId),
             rejected: (error, message) => {
                 console.warn(`[paper-stage] commit rejected: ${error} ${message}`);
-                if (error === "limit")
-                    void host.hint("The stage is full", [
-                        "The stage server refused more items. Remove some drawings from the frame.",
-                    ]);
                 scheduleFlush(RETRY_MS);
             },
             refused: (reason) =>
