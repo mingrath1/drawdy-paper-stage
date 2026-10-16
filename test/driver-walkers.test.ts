@@ -13,7 +13,9 @@ function fakeDrawdy() {
     const issue = ((request: Request) => {
         requests.push(request);
         const value =
-            request.type === "command:scene:create-drawdy-preview-elements" ? { previewed: 2, previewId: `pv${++previews}` } : {};
+            request.type === "command:scene:create-drawdy-preview-elements"
+                ? { previewed: 2, previewId: `pv${++previews}` }
+                : {};
         return Promise.resolve({ ...request, res: { value } });
     }) as unknown as DriverCommandIssuer;
     const of = (type: string) => requests.filter((request) => request.type === type);
@@ -52,7 +54,9 @@ describe("WalkerMarkers", () => {
         expect(centerOf(elements)).toEqual({ x: 300, y: 200 });
         expect(dotOf(elements)).toMatchObject({ componentType: "circle", fillColor: "#0ca678" });
         expect(elements.find((element) => element.type === "text")).toMatchObject({ text: "Ploy" });
-        expect(drawdy.requests.map((request) => request.type)).toEqual(["command:scene:create-drawdy-preview-elements"]);
+        expect(drawdy.requests.map((request) => request.type)).toEqual([
+            "command:scene:create-drawdy-preview-elements",
+        ]);
     });
 
     it("eases toward each new pose instead of jumping, then goes quiet once it arrives", async () => {
@@ -80,7 +84,9 @@ describe("WalkerMarkers", () => {
             .map((update) => dotOf(update.req!.elements).opacity as number);
         expect(opacities.length).toBeGreaterThan(1);
         expect(opacities).toEqual([...opacities].sort((a, b) => b - a));
-        expect(drawdy.of("command:scene:delete-drawdy-preview-elements").map((r) => r.req!.previewIds)).toEqual([["pv1"]]);
+        expect(drawdy.of("command:scene:delete-drawdy-preview-elements").map((r) => r.req!.previewIds)).toEqual([
+            ["pv1"],
+        ]);
     });
 
     it("keeps an idle walker whose keepalive poses keep coming", async () => {
@@ -99,7 +105,9 @@ describe("WalkerMarkers", () => {
         await vi.advanceTimersByTimeAsync(0);
         markers.leave("v1");
         await vi.advanceTimersByTimeAsync(1_000);
-        expect(drawdy.of("command:scene:delete-drawdy-preview-elements").map((r) => r.req!.previewIds)).toEqual([["pv1"]]);
+        expect(drawdy.of("command:scene:delete-drawdy-preview-elements").map((r) => r.req!.previewIds)).toEqual([
+            ["pv1"],
+        ]);
         await markers.stop();
         expect(drawdy.of("command:scene:delete-drawdy-preview-elements").map((r) => r.req!.previewIds)).toEqual([
             ["pv1"],

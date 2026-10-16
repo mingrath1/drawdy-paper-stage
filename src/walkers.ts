@@ -121,7 +121,8 @@ export class WalkerMarkers {
             else if (this.markers.get(id) === marker) marker.previewId = created.value.previewId;
             else gone.push(created.value.previewId);
         }
-        if (updates.length > 0) await this.host.call("command:scene:update-drawdy-preview-elements", { elements: updates });
+        if (updates.length > 0)
+            await this.host.call("command:scene:update-drawdy-preview-elements", { elements: updates });
         if (gone.length > 0) await this.host.call("command:scene:delete-drawdy-preview-elements", { previewIds: gone });
     }
 
@@ -180,7 +181,6 @@ function ease(marker: Marker): boolean {
     if (same(shown, target)) return false;
     const dx = target.x - shown.x;
     const dy = target.y - shown.y;
-    marker.shown =
-        Math.hypot(dx, dy) < SETTLE ? target : { x: shown.x + dx * EASE, y: shown.y + dy * EASE };
+    marker.shown = Math.hypot(dx, dy) < SETTLE ? target : { x: shown.x + dx * EASE, y: shown.y + dy * EASE };
     return true;
 }

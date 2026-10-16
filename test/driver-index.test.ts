@@ -65,7 +65,8 @@ async function decodeFakePng(blob: Blob): Promise<FakeBitmap> {
     return { ...shot, close() {} };
 }
 
-const pictureOf = (message: Extract<ClientMessage, { type: "asset.put" }>) => JSON.parse(atob(message.pngBase64)) as Rect;
+const pictureOf = (message: Extract<ClientMessage, { type: "asset.put" }>) =>
+    JSON.parse(atob(message.pngBase64)) as Rect;
 
 const FRAME_ID = "frame";
 const frame: SubscribedDrawdyElement = {
@@ -223,7 +224,11 @@ describe("the driver against a fake Drawdy", () => {
         await vi.advanceTimersByTimeAsync(500);
         const area = captureArea(rectOf(doodle("d", 100, 100))!, 0);
         expect(puts(socket).map(pictureOf)).toEqual([area]);
-        expect(writes(socket).at(-1)).toMatchObject({ type: "scene.commit", reset: true, upserts: [{ id: "d", rect: area }] });
+        expect(writes(socket).at(-1)).toMatchObject({
+            type: "scene.commit",
+            reset: true,
+            upserts: [{ id: "d", rect: area }],
+        });
     });
 
     it("throws away a capture of a cutout that moved while Drawdy exported it, and captures it again", async () => {
@@ -267,11 +272,22 @@ describe("the driver against a fake Drawdy", () => {
         const fake = new FakeDrawdy([frame]);
         fake.users = [
             ...fake.users,
-            { id: "friend", name: "Ploy", color: "#0ca678", isHost: false, isSelf: false, cursorPosition: { x: 5, y: 6 } },
+            {
+                id: "friend",
+                name: "Ploy",
+                color: "#0ca678",
+                isHost: false,
+                isSelf: false,
+                cursorPosition: { x: 5, y: 6 },
+            },
         ];
         const { socket } = await startDriver(fake);
         expect(socket.sent.filter((m) => m.type === "cursors")).toEqual([
-            { type: "cursors", epoch: 1, cursors: [{ presenceId: "friend", name: "Ploy", color: "#0ca678", x: 5, y: 6 }] },
+            {
+                type: "cursors",
+                epoch: 1,
+                cursors: [{ presenceId: "friend", name: "Ploy", color: "#0ca678", x: 5, y: 6 }],
+            },
         ]);
     });
 
@@ -291,7 +307,10 @@ describe("the driver against a fake Drawdy", () => {
         const { socket } = await startDriver(fake);
         const me = { presenceId: "me", name: "Ming", color: "#7c3aed" };
         for (let x = 300; x <= 400; x += 20) {
-            socket.receive({ type: "walker", walker: { connectionId: "v1", participant: me, pose: { x, y: 250, heading: 0, pitch: 0 } } });
+            socket.receive({
+                type: "walker",
+                walker: { connectionId: "v1", participant: me, pose: { x, y: 250, heading: 0, pitch: 0 } },
+            });
             await vi.advanceTimersByTimeAsync(50);
         }
         await vi.advanceTimersByTimeAsync(3_000);

@@ -132,10 +132,7 @@ describe("planSync", () => {
 
     it("removes before it adds, so no commit of a swap on a full stage passes the item cap", () => {
         const before = Array.from({ length: MAX_ITEMS_PER_STAGE }, (_, i) => wall(`old${i}`, i));
-        const after = [
-            ...before.slice(150),
-            ...Array.from({ length: 150 }, (_, i) => wall(`new${i}`, i)),
-        ];
+        const after = [...before.slice(150), ...Array.from({ length: 150 }, (_, i) => wall(`new${i}`, i))];
         const stored = new Map(before.map((item) => [item.id, item]));
         for (const message of commits(
             planSync({
@@ -491,7 +488,13 @@ describe("Relay", () => {
         socket.receive({ type: "walker.left", connectionId: "v1" });
         relay.commit(1, desired([wall("w")]));
         const sent = socket.sent.at(-1) as Extract<ClientMessage, { type: "scene.commit" }>;
-        socket.receive({ type: "ack", requestId: sent.requestId, ok: false, error: "bad_message", message: "bad item" });
+        socket.receive({
+            type: "ack",
+            requestId: sent.requestId,
+            ok: false,
+            error: "bad_message",
+            message: "bad item",
+        });
         expect(handlers.walker).toHaveBeenCalledWith(walker);
         expect(handlers.walkerLeft).toHaveBeenCalledWith("v1");
         expect(handlers.rejected).toHaveBeenCalledWith("bad_message", "bad item");
@@ -721,5 +724,4 @@ describe("Outbox", () => {
         for (let i = 0; i < 2; i++, now += SEND_GAP_MS) drain(second);
         expect(second.settle("c2")?.lost).toBe(true);
     });
-
 });

@@ -52,9 +52,9 @@ describe("belongsToStage", () => {
         expect(belongsToStage(el("e", { frameId: "other-frame", x: 100, y: 100 }), FRAME_ID, rect)).toBe(false);
     });
     it("tests the center of an element whose frameId was cleared", () => {
-        expect(belongsToStage(el("e", { frameId: null, x: 100, y: 100 } as Partial<BoardElement>), FRAME_ID, rect)).toBe(
-            true,
-        );
+        expect(
+            belongsToStage(el("e", { frameId: null, x: 100, y: 100 } as Partial<BoardElement>), FRAME_ID, rect),
+        ).toBe(true);
     });
     it("leaves out an element whose center lies outside the frame", () => {
         expect(belongsToStage(el("e", { x: 890, y: 100, width: 40, height: 20 }), FRAME_ID, rect)).toBe(false);

@@ -198,7 +198,8 @@ describe("CutoutCache", () => {
         for (let i = 0; i < 8; i++) {
             cache.set("d", "v1", { ok: false, reason: "failed" });
             const pending = cache.get("d", "v1");
-            if (!pending || !("retryInMs" in pending)) throw new Error(`expected a backoff, got ${JSON.stringify(pending)}`);
+            if (!pending || !("retryInMs" in pending))
+                throw new Error(`expected a backoff, got ${JSON.stringify(pending)}`);
             waits.push(pending.retryInMs);
             now += pending.retryInMs - 1;
             expect(cache.get("d", "v1")).toEqual({ retryInMs: 1 });
