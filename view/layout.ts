@@ -14,6 +14,8 @@ import {
 export const WALL_THICKNESS_M = 0.12;
 export const WALKER_RADIUS_M = 0.25;
 export const HAND_HEIGHT_M = 2.2;
+/** At 100 units a meter, a default 200 unit sticky would stand 1.93 m, a poster beside 2.6 m walls. */
+const MAX_CUTOUT_HEIGHT_M = 1.2;
 const CIRCLE_SEGMENTS = 48;
 
 export type Point = { x: number; z: number };
@@ -238,14 +240,15 @@ export function refloor(p: Point, from: Rect, to: Rect): Point {
 
 export type CutoutPlan = { center: Point; width: number; height: number };
 
-/** A cutout stands at the center of its board rect, as wide as the rect, as tall as its picture's proportions. */
+/**
+ * A cutout stands at the center of its board rect, as wide as the rect and as tall as its picture's proportions, until
+ * it would stand taller than `MAX_CUTOUT_HEIGHT_M`. Then it shrinks to that height and keeps its proportions.
+ */
 export function cutoutPlan(cutout: CutoutItem, frame: Rect): CutoutPlan {
     const width = cutout.rect.width / CANVAS_UNITS_PER_METER;
-    return {
-        center: rectCenterToWorld(cutout.rect, frame),
-        width,
-        height: (width * cutout.asset.height) / Math.max(1, cutout.asset.width),
-    };
+    const height = (width * cutout.asset.height) / Math.max(1, cutout.asset.width);
+    const scale = Math.min(1, MAX_CUTOUT_HEIGHT_M / height);
+    return { center: rectCenterToWorld(cutout.rect, frame), width: width * scale, height: height * scale };
 }
 
 export type HandPlan = { position: Point; hoverHeight: number; inFrame: boolean };

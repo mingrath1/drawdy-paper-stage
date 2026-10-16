@@ -206,19 +206,24 @@ describe("a frame that changes under a walker", () => {
 });
 
 describe("cutouts", () => {
-    it("stands at its rect center, as wide as the rect, as tall as the picture's proportions", () => {
-        const plan = cutoutPlan(
-            {
-                kind: "cutout",
-                id: "c",
-                rect: { x: 1100, y: 2100, width: 150, height: 290 },
-                asset: { hash: "h", width: 300, height: 600 },
-            },
+    const cutout = (width: number, asset: { width: number; height: number }) =>
+        cutoutPlan(
+            { kind: "cutout", id: "c", rect: { x: 1100, y: 2100, width, height: 290 }, asset: { hash: "h", ...asset } },
             frame,
         );
-        expect(plan.center).toEqual({ x: -4.25, z: -1.55 });
-        expect(plan.width).toBe(1.5);
-        expect(plan.height).toBe(3);
+
+    it("stands at its rect center, as wide as the rect, as tall as the picture's proportions", () => {
+        const plan = cutout(100, { width: 300, height: 150 });
+        expect(plan.center).toEqual({ x: -4.5, z: -1.55 });
+        expect(plan.width).toBe(1);
+        expect(plan.height).toBe(0.5);
+    });
+
+    it("shrinks a default sticky to person height, keeping its foot and proportions", () => {
+        const plan = cutout(200, { width: 400, height: 386 });
+        expect(plan.center).toEqual({ x: -4, z: -1.55 });
+        expect(plan.height).toBeCloseTo(1.2, 9);
+        expect(plan.width / plan.height).toBeCloseTo(400 / 386, 9);
     });
 });
 
