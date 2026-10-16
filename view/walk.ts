@@ -1,6 +1,6 @@
 import { EYE_HEIGHT_METERS, headingToCameraYaw, worldToCanvas, type Pose, type Rect } from "../shared/protocol";
 import type { PerspectiveCamera } from "./vendor/three.module.js";
-import { clamp, moveWalker, type Bounds, type Point, type Segment } from "./layout";
+import { clamp, moveWalker, refloor, settleWalker, type Bounds, type Point, type Segment } from "./layout";
 import { PITCH_LIMIT, normalizeHeading } from "./pose";
 
 const WALK_SPEED = 2.6;
@@ -22,12 +22,17 @@ const MOVES: Record<string, [number, number]> = {
 /** Positive turns left: heading grows toward +x, which is the walker's left when facing +z. */
 const TURNS: Record<string, number> = { KeyQ: 1, KeyE: -1 };
 
+/** What the walker stands on. `frame` is null until the stage has a real one. */
+export type Ground = { frame: Rect | null; pawn: Point | null; collisionEdges: Segment[]; bounds: Bounds };
+
 /**
  * First person walking for a sandboxed iframe: keys after one click, and click-and-drag to look, because pointer lock
  * is blocked. Facing is (sin heading, cos heading) on the floor, the convention `Pose` documents.
  */
 export class WalkControls {
     position: Point = { x: 0, z: 0 };
+    /** Whether the walker has stood at the pawn yet. Until then it waits at the floor's center. */
+    private spawned = false;
     heading = Math.PI;
     pitch = 0;
     walked = false;
@@ -54,18 +59,35 @@ export class WalkControls {
         });
         surface.addEventListener("pointermove", (event) => {
             if (this.drag?.pointer !== event.pointerId) return;
+            if (event.buttons === 0) {
+                this.drag = null;
+                return;
+            }
             this.look(event.clientX - this.drag.x, event.clientY - this.drag.y);
             this.drag = { pointer: event.pointerId, x: event.clientX, y: event.clientY };
         });
+        /** Pointer capture stops at the iframe's edge, so a button released outside the view sends no pointerup. */
         const release = (event: PointerEvent) => {
             if (this.drag?.pointer === event.pointerId) this.drag = null;
         };
-        surface.addEventListener("pointerup", release);
-        surface.addEventListener("pointercancel", release);
+        for (const ending of ["pointerup", "pointercancel", "pointerleave", "lostpointercapture"] as const)
+            surface.addEventListener(ending, release);
     }
 
-    spawn(at: Point, edges: Segment[], bounds: Bounds): void {
-        this.position = moveWalker(at, { x: 0, z: 0 }, edges, bounds);
+    /**
+     * Keeps the walker standing somewhere sensible after the stage changed under it. `before` is the frame the stage
+     * had before the change. The walker spawns at the pawn once the stage has a real frame and a pawn.
+     */
+    settle(ground: Ground, before: Rect | null): void {
+        const { frame, pawn } = ground;
+        if (!frame) return;
+        if (!this.spawned && pawn) {
+            this.position = pawn;
+            this.spawned = true;
+        } else if (before) {
+            this.position = refloor(this.position, before, frame);
+        }
+        this.position = settleWalker(this.position, pawn ?? { x: 0, z: 0 }, ground.collisionEdges, ground.bounds);
     }
 
     /** Dragging right looks right and dragging up looks up. */

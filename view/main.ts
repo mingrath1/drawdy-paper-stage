@@ -12,7 +12,7 @@ import {
     Scene,
     WebGLRenderer,
 } from "./vendor/three.module.js";
-import { CutoutTextures } from "./assets";
+import { AssetCache, cutoutLoader, freeCutout } from "./assets";
 import { Bodies } from "./bodies";
 import { Hands } from "./hands";
 import { Hud } from "./hud";
@@ -51,34 +51,34 @@ const desk = new Mesh(
 );
 scene.add(desk);
 
-const stage = new StageModel(new CutoutTextures(boot, renderer.capabilities.getMaxAnisotropy()), sun);
+const anisotropy = renderer.capabilities.getMaxAnisotropy();
+const stage = new StageModel(new AssetCache(cutoutLoader(boot, anisotropy), freeCutout), sun, anisotropy);
 const bodies = new Bodies();
 const hands = new Hands(boot.participant.presenceId);
 scene.add(stage.root, bodies.root, hands.root);
 
 const walk = new WalkControls(canvas);
-let spawned = false;
 let poseClock = IDLE_POSE_CLOCK;
 let connectionId = "";
 
 const HANDLERS: { [K in ServerMessage["type"]]: (message: Extract<ServerMessage, { type: K }>) => void } = {
     welcome(message) {
         connectionId = message.connectionId;
+        const before = stage.frame;
         stage.load(message.snapshot);
-        const frame = message.snapshot.frame;
+        walk.settle(stage, before);
         bodies.reset(
             message.walkers.filter((w) => w.connectionId !== connectionId),
-            frame,
+            stage.frame,
             performance.now(),
         );
-        if (!spawned) {
-            walk.spawn(stage.pawn ?? { x: 0, z: 0 }, stage.collisionEdges, stage.bounds);
-            spawned = true;
-        }
+        hands.clear();
         poseClock = IDLE_POSE_CLOCK;
     },
     "scene.patch"(message) {
+        const before = stage.frame;
         stage.apply(message);
+        walk.settle(stage, before);
     },
     walker(message) {
         if (stage.frame && message.walker.connectionId !== connectionId)
@@ -88,12 +88,14 @@ const HANDLERS: { [K in ServerMessage["type"]]: (message: Extract<ServerMessage,
         bodies.remove(message.connectionId);
     },
     cursors(message) {
-        if (stage.frame) hands.set(message.cursors, stage.frame);
+        if (stage.frame) hands.set(message.cursors, stage.frame, performance.now());
     },
     error(message) {
         console.warn("paper-stage:", message.code, message.message);
     },
-    writer() {},
+    writer() {
+        hands.clear();
+    },
     ack() {},
     pong() {},
 };
@@ -101,19 +103,26 @@ const HANDLERS: { [K in ServerMessage["type"]]: (message: Extract<ServerMessage,
 const link = new StageLink(
     boot,
     (message) => (HANDLERS[message.type] as (message: ServerMessage) => void)(message),
-    (status) => hud.link(status),
+    (status) => {
+        hud.link(status);
+        if (status.kind !== "live") hands.clear();
+    },
 );
 
-function resize(): void {
-    renderer.setSize(innerWidth, innerHeight, false);
-    camera.aspect = innerWidth / Math.max(1, innerHeight);
+let drawn = { width: -1, height: -1 };
+
+/** Sizes the drawing buffer to the canvas's box. A floating iframe can mount at 0x0 and grow with no resize event. */
+function fitCanvas(): void {
+    const { clientWidth: width, clientHeight: height } = canvas;
+    if (width === drawn.width && height === drawn.height) return;
+    drawn = { width, height };
+    renderer.setSize(width, height, false);
+    camera.aspect = width / Math.max(1, height);
     camera.updateProjectionMatrix();
 }
-addEventListener("resize", resize);
-resize();
 
-/** Read by verification scripts: the last whole second's frame rate and what was on stage. */
-const stats = { fps: 0, walls: 0, cutouts: 0, drawCalls: 0 };
+/** Read by verification scripts: the last whole second's frame rate, what was on stage, and where the walker stood. */
+const stats = { fps: 0, walls: 0, cutouts: 0, drawCalls: 0, textures: 0, walker: { x: 0, z: 0 } };
 Object.assign(globalThis, { paperStage: stats });
 
 let frames = 0;
@@ -121,6 +130,7 @@ let windowStart = performance.now();
 let last = windowStart;
 
 renderer.setAnimationLoop(() => {
+    fitCanvas();
     const now = performance.now();
     const dt = Math.min((now - last) / 1000, 0.05);
     last = now;
@@ -133,10 +143,10 @@ renderer.setAnimationLoop(() => {
         poseClock = step.clock;
         if (step.send) link.send({ type: "pose", pose: step.send });
     }
-    stage.update(dt);
+    stage.update(dt, walk.position);
     if (frame) {
         bodies.update(dt, now, frame);
-        hands.update(dt, now / 1000, frame);
+        hands.update(dt, now, frame);
     }
     renderer.render(scene, camera);
 
@@ -146,9 +156,11 @@ renderer.setAnimationLoop(() => {
         stats.walls = stage.walls;
         stats.cutouts = stage.cutouts;
         stats.drawCalls = renderer.info.render.calls;
+        stats.textures = renderer.info.memory.textures;
+        stats.walker = walk.position;
         frames = 0;
         windowStart = now;
         hud.frameRate(stats.fps);
-        hud.count(new Set([boot.participant.presenceId, ...bodies.presenceIds(), ...hands.presenceIds()]).size);
+        hud.count(new Set([boot.participant.presenceId, ...bodies.presenceIds(), ...hands.presenceIds(now)]).size);
     }
 });

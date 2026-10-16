@@ -18,7 +18,8 @@ export class Hud {
 
     constructor() {
         addEventListener("keydown", (event) => {
-            if (event.code === "KeyF" && !event.metaKey && !event.ctrlKey) this.fps.hidden = !this.fps.hidden;
+            if (event.code === "KeyF" && !event.repeat && !event.metaKey && !event.ctrlKey)
+                this.fps.hidden = !this.fps.hidden;
         });
         setInterval(() => this.render(), 500);
     }

@@ -4,6 +4,7 @@ import {
     Color,
     ConeGeometry,
     DirectionalLight,
+    DoubleSide,
     EdgesGeometry,
     ExtrudeGeometry,
     Float32BufferAttribute,
@@ -20,8 +21,9 @@ import {
     Shape,
     Vector2,
     type Object3D,
+    type Texture,
 } from "./vendor/three.module.js";
-import type { CutoutTextures } from "./assets";
+import type { AssetCache } from "./assets";
 import { INK, PAPER, floorPaper, paperMaterial } from "./drawings";
 import {
     cutoutPlan,
@@ -54,9 +56,13 @@ type Kind<I extends StageItem> = {
     /** Applies a new version of the item. Placement is handled for every kind by the caller. */
     update(object: Object3D, item: I, previous: I, frame: Rect, stage: StageModel): void;
     place(item: I, frame: Rect): Placement;
-    dispose(object: Object3D): void;
-    /** Whether the object may start rising; a cutout waits for its texture. */
+    /** Runs every frame with the viewer's eye on the floor. */
+    tick?(object: Object3D, item: I, eye: Point, stage: StageModel): void;
+    dispose(object: Object3D, item: I, stage: StageModel): void;
+    /** Whether the object may start rising; a cutout waits for its picture. */
     ready(object: Object3D): boolean;
+    /** Shows the object `eased` of the way risen, from 0 hidden in the floor to 1 standing. */
+    rise(object: Object3D, eased: number): void;
 };
 
 const RISE_SECONDS = 0.7;
@@ -135,51 +141,82 @@ const WALL: Kind<WallItem> = {
     },
     dispose: emptyGroup,
     ready: () => true,
+    rise(group, eased) {
+        group.scale.y = Math.max(eased, 0.001);
+    },
 };
 
-function cutoutScale(mesh: Object3D, cutout: CutoutItem, frame: Rect): void {
-    const plan = cutoutPlan(cutout, frame);
-    mesh.scale.set(plan.width, plan.height, 1);
-}
-
-function showTexture(mesh: Mesh, cutout: CutoutItem, stage: StageModel): void {
-    stage.textures.get(cutout.asset.hash).then(
-        (texture) => {
-            const material = mesh.material as MeshLambertMaterial;
-            if (mesh.userData.hash !== cutout.asset.hash) return;
-            material.map = texture;
-            material.emissiveMap = texture;
-            material.needsUpdate = true;
-            mesh.visible = true;
-        },
-        (error) => console.warn("paper-stage: cutout picture failed", cutout.id, error),
+/**
+ * A cutout turns its picture about its foot to face the viewer, Paper Mario style, so it never stands edge-on or reads
+ * mirrored. An unseen copy facing the sun casts the shadow, so the shadow holds still while the viewer walks around.
+ */
+class Cutout extends Group {
+    readonly face = new Mesh(cutoutGeometry, paperMaterial());
+    readonly caster = new Mesh(
+        cutoutGeometry,
+        new MeshBasicMaterial({ side: DoubleSide, alphaTest: 0.5, colorWrite: false, depthWrite: false }),
     );
+
+    constructor(sunYaw: number) {
+        super();
+        this.face.rotation.order = this.caster.rotation.order = "YXZ";
+        this.caster.rotation.y = sunYaw;
+        this.caster.castShadow = true;
+        this.visible = false;
+        this.add(this.face, this.caster);
+    }
+
+    /** Shows `picture`, or hides the cutout while it has none. */
+    show(picture: Texture | null): void {
+        if (this.face.material.map === picture) return;
+        this.face.material.map = this.face.material.emissiveMap = this.caster.material.map = picture;
+        this.face.material.needsUpdate = this.caster.material.needsUpdate = true;
+        this.visible = picture !== null;
+    }
+
+    resize(cutout: CutoutItem, frame: Rect): void {
+        const { width, height } = cutoutPlan(cutout, frame);
+        this.face.scale.set(width, height, 1);
+        this.caster.scale.set(width, height, 1);
+    }
+
+    dispose(): void {
+        this.face.material.dispose();
+        this.caster.material.dispose();
+    }
 }
 
 const CUTOUT: Kind<CutoutItem> = {
-    create(cutout, frame, stage) {
-        const mesh = new Mesh(cutoutGeometry, paperMaterial());
-        mesh.castShadow = true;
-        mesh.visible = false;
-        mesh.userData.hash = cutout.asset.hash;
-        cutoutScale(mesh, cutout, frame);
-        showTexture(mesh, cutout, stage);
-        return mesh;
+    create(item, frame, stage) {
+        const cutout = new Cutout(stage.sunYaw);
+        cutout.resize(item, frame);
+        stage.textures.acquire(item.asset.hash);
+        return cutout;
     },
-    update(mesh, cutout, previous, frame, stage) {
-        cutoutScale(mesh, cutout, frame);
-        if (cutout.asset.hash === previous.asset.hash) return;
-        mesh.userData.hash = cutout.asset.hash;
-        showTexture(mesh as Mesh, cutout, stage);
+    update(cutout, item, previous, frame, stage) {
+        (cutout as Cutout).resize(item, frame);
+        if (item.asset.hash === previous.asset.hash) return;
+        stage.textures.acquire(item.asset.hash);
+        stage.textures.release(previous.asset.hash);
+        (cutout as Cutout).show(null);
     },
-    place(cutout, frame) {
-        const { center } = cutoutPlan(cutout, frame);
+    place(item, frame) {
+        const { center } = cutoutPlan(item, frame);
         return { x: center.x, z: center.z, yaw: 0 };
     },
-    dispose(mesh) {
-        ((mesh as Mesh).material as MeshLambertMaterial).dispose();
+    tick(cutout, item, eye, stage) {
+        (cutout as Cutout).show(stage.textures.get(item.asset.hash));
+        (cutout as Cutout).face.rotation.y = Math.atan2(eye.x - cutout.position.x, eye.z - cutout.position.z);
     },
-    ready: (mesh) => mesh.visible,
+    dispose(cutout, item, stage) {
+        stage.textures.release(item.asset.hash);
+        (cutout as Cutout).dispose();
+    },
+    ready: (cutout) => cutout.visible,
+    rise(cutout, eased) {
+        const { face, caster } = cutout as Cutout;
+        face.rotation.x = caster.rotation.x = -(1 - eased) * (Math.PI / 2);
+    },
 };
 
 const pawnRing = new RingGeometry(0.28, 0.4, 40).rotateX(-Math.PI / 2).translate(0, 0.012, 0);
@@ -199,6 +236,7 @@ const PAWN: Kind<PawnItem> = {
     },
     dispose() {},
     ready: () => true,
+    rise() {},
 };
 
 const KINDS: { [K in StageItem["kind"]]: Kind<Extract<StageItem, { kind: K }>> } = {
@@ -217,6 +255,8 @@ export type ScenePatch = { reset?: true; frame?: Rect; upserts: StageItem[]; rem
 export class StageModel {
     readonly root = new Group();
     frame: Rect | null = null;
+    /** The heading that faces the sun across the floor. */
+    readonly sunYaw: number;
     private readonly nodes = new Map<ElementId, Node>();
     private edges: Segment[] = [];
     private edgesStale = true;
@@ -224,11 +264,13 @@ export class StageModel {
     private readonly border: LineLoop;
 
     constructor(
-        readonly textures: CutoutTextures,
+        readonly textures: AssetCache<Texture>,
         private readonly sun: DirectionalLight,
+        anisotropy: number,
     ) {
+        this.sunYaw = Math.atan2(sun.position.x - sun.target.position.x, sun.position.z - sun.target.position.z);
         const paper = floorPaper();
-        paper.anisotropy = textures.anisotropy;
+        paper.anisotropy = anisotropy;
         this.floor = new Mesh(new PlaneGeometry(1, 1).rotateX(-Math.PI / 2), new MeshLambertMaterial({ map: paper }));
         this.floor.receiveShadow = true;
         this.border = new LineLoop(
@@ -247,6 +289,7 @@ export class StageModel {
         for (const node of this.nodes.values()) this.snap(node);
     }
 
+    /** A frame with no area, as a new stage has before its writer's first commit, leaves the frame as it was. */
     apply(patch: ScenePatch): void {
         if (patch.frame) this.setFrame(patch.frame);
         const frame = this.frame;
@@ -255,6 +298,7 @@ export class StageModel {
         const removes = patch.reset ? [...this.nodes.keys()].filter((id) => !kept.has(id)) : patch.removes;
         for (const id of removes) this.remove(id);
         for (const item of patch.upserts) this.upsert(item, frame);
+        if (patch.reset) this.textures.retryFailed();
     }
 
     get walls(): number {
@@ -287,14 +331,16 @@ export class StageModel {
         return this.edges;
     }
 
-    update(dt: number): void {
+    update(dt: number, eye: Point): void {
         const follow = 1 - Math.exp(-12 * dt);
         for (const node of this.nodes.values()) {
             const { object, target } = node;
+            const kind = kindOf(node.item);
             object.position.x += (target.x - object.position.x) * follow;
             object.position.z += (target.z - object.position.z) * follow;
             object.rotation.y += angleBetween(object.rotation.y, target.yaw) * follow;
-            if (node.rise < 1 && kindOf(node.item).ready(object)) {
+            kind.tick?.(object, node.item, eye, this);
+            if (node.rise < 1 && kind.ready(object)) {
                 node.rise = Math.min(1, node.rise + dt / RISE_SECONDS);
                 this.showRise(node);
             }
@@ -302,9 +348,7 @@ export class StageModel {
     }
 
     private showRise(node: Node): void {
-        const eased = 1 - (1 - node.rise) ** 3;
-        if (node.item.kind === "wall") node.object.scale.y = Math.max(eased, 0.001);
-        if (node.item.kind === "cutout") node.object.rotation.x = -(1 - eased) * (Math.PI / 2);
+        kindOf(node.item).rise(node.object, 1 - (1 - node.rise) ** 3);
     }
 
     private upsert(item: StageItem, frame: Rect): void {
@@ -329,7 +373,7 @@ export class StageModel {
     private remove(id: ElementId): void {
         const node = this.nodes.get(id);
         if (!node) return;
-        kindOf(node.item).dispose(node.object);
+        kindOf(node.item).dispose(node.object, node.item, this);
         this.root.remove(node.object);
         this.nodes.delete(id);
         if (node.item.kind === "wall") this.edgesStale = true;
@@ -341,6 +385,7 @@ export class StageModel {
     }
 
     private setFrame(frame: Rect): void {
+        if (!(frame.width > 0 && frame.height > 0)) return;
         this.frame = frame;
         this.edgesStale = true;
         const { minX, maxX, minZ, maxZ } = floorBounds(frame);

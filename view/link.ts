@@ -95,7 +95,9 @@ export class StageLink {
         this.setStatus({ kind: "connecting" });
         const socket = new WebSocket(stageSocketUrl(this.boot.backendUrl, this.boot.stageId));
         this.socket = socket;
+        this.lastHeard = Date.now();
         socket.onopen = () => {
+            if (socket !== this.socket) return;
             this.lastHeard = Date.now();
             this.send({
                 type: "hello",
@@ -107,6 +109,7 @@ export class StageLink {
             });
         };
         socket.onmessage = (event) => {
+            if (socket !== this.socket) return;
             this.lastHeard = Date.now();
             const message = decodeServerFrame(event.data);
             if (!message) return;
@@ -137,10 +140,13 @@ export class StageLink {
         this.retryTimer = setTimeout(() => this.open(), delay);
     }
 
-    /** A socket can die without a close event, for example when the laptop changes networks. */
+    /**
+     * A socket can die without a close event, and a handshake can hang, for example when the laptop changes networks.
+     * Either way the link hears nothing for SILENCE_LIMIT_MS and starts over.
+     */
     private heartbeat(): void {
         const socket = this.socket;
-        if (!socket || socket.readyState !== WebSocket.OPEN) return;
+        if (!socket) return;
         if (Date.now() - this.lastHeard > SILENCE_LIMIT_MS) {
             socket.close();
             this.closed(socket, 1006);
