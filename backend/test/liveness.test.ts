@@ -1,4 +1,4 @@
-import { runInDurableObject } from "cloudflare:test";
+import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { CLOSE, type ServerMessage } from "../../shared/protocol.ts";
@@ -100,19 +100,89 @@ describe.concurrent("liveness", () => {
       expect((await zombie.client.expect("writer")).writer).toEqual(writer);
       expect(await zombie.client.expect("ack")).toMatchObject({ ok: false, error: "not_writer" });
       awake.client.send(commit(writer.epoch, "fresh", { upserts: [wall("a")] }));
-      expect(await awake.client.expect("ack")).toMatchObject({ ok: true, revision: 1 });
+      expect(await pingUntil(awake.client, "ack", 3_000)).toMatchObject({ ok: true, revision: 1 });
     },
   );
 
   it(
-    "re-runs the election on a refused commit before the sweep runs",
+    "keeps a lone writer's seat through 60 s of silence, and takes its next commit",
+    { timeout: 75_000 },
+    async () => {
+      const stageId = freshStage();
+      const { client, epoch } = await writerOf(stageId);
+      await sleep(60_000);
+      client.send(commit(epoch, "after-silence", { upserts: [wall("a")] }));
+      expect(await client.expect("ack")).toMatchObject({ ok: true, revision: 1 });
+    },
+  );
+
+  it(
+    "keeps a lone silent writer's seat when its object wakes from eviction",
+    { timeout: 45_000 },
+    async () => {
+      const stageId = freshStage();
+      const stub = env.STAGES.getByName(stageId);
+      const { client, epoch } = await writerOf(stageId);
+      await runInDurableObject(stub, (_instance, state) => state.storage.deleteAlarm());
+      await sleep(31_000);
+      // An idle object with only hibernatable sockets may already be gone.
+      await evictDurableObject(stub).catch(() => {});
+      client.send(commit(epoch, "after-wake", { upserts: [wall("a")] }));
+      expect(await client.expect("ack")).toMatchObject({ ok: true, revision: 1 });
+    },
+  );
+
+  it(
+    "hands the seat from a silent writer to a driver heard from again after both went quiet",
+    { timeout: 45_000 },
+    async () => {
+      const stageId = freshStage();
+      const zombie = await writerOf(stageId);
+      const returning = await join(stageId, "driver", "returning");
+      await sleep(31_000);
+      returning.client.send({ type: "ping", t: 0 });
+      const { writer } = await pingUntil(returning.client, "writer", 3_000);
+      expect(writer).toEqual({
+        connectionId: returning.welcome.connectionId,
+        epoch: zombie.epoch + 1,
+      });
+    },
+  );
+
+  it("sets no alarm for a lone writer once its hello is in", async () => {
+    const stageId = freshStage();
+    const { client } = await writerOf(stageId);
+    await client.expectQuiet();
+    const alarm = await runInDurableObject(env.STAGES.getByName(stageId), (_instance, state) =>
+      state.storage.getAlarm(),
+    );
+    expect(alarm).toBeNull();
+  });
+
+  it("wakes at a writer's silence deadline while another driver is live", async () => {
+    const stageId = freshStage();
+    const before = Date.now();
+    await writerOf(stageId);
+    const { client: standby } = await join(stageId, "driver", "standby");
+    await standby.expectQuiet();
+    const alarm = await runInDurableObject(env.STAGES.getByName(stageId), (_instance, state) =>
+      state.storage.getAlarm(),
+    );
+    expect(alarm).toBeGreaterThanOrEqual(before + 30_000);
+    expect(alarm).toBeLessThanOrEqual(Date.now() + 30_000);
+  });
+
+  it(
+    "re-runs the election on a standby's commit before the sweep runs",
     { timeout: 45_000 },
     async () => {
       const { zombie, awake } = await silentWriterWithoutSweep();
       awake.client.send(commit(zombie.epoch, "early", { upserts: [wall("a")] }));
-      expect(await awake.client.expect("ack")).toMatchObject({ ok: false, error: "not_writer" });
       const { writer } = await awake.client.expect("writer");
       expect(writer).toEqual({ connectionId: awake.welcome.connectionId, epoch: zombie.epoch + 1 });
+      expect(await awake.client.expect("ack")).toMatchObject({ ok: false, error: "stale_epoch" });
+      awake.client.send(commit(writer.epoch, "fresh", { upserts: [wall("a")] }));
+      expect(await awake.client.expect("ack")).toMatchObject({ ok: true, revision: 1 });
     },
   );
 
@@ -132,7 +202,10 @@ describe.concurrent("liveness", () => {
   );
 });
 
-/** A stage whose writer has been silent for 31 s while another driver pinged, with the alarm sweep switched off. */
+/**
+ * A stage whose writer has been silent for 31 s while another driver last pinged 6 s ago, with the alarm sweep
+ * switched off. The standby stops pinging before the writer's deadline, since its next frame would take the seat.
+ */
 async function silentWriterWithoutSweep() {
   const stageId = freshStage();
   const zombie = await writerOf(stageId);
@@ -143,10 +216,10 @@ async function silentWriterWithoutSweep() {
     await runInDurableObject(env.STAGES.getByName(stageId), (_instance, state) =>
       state.storage.deleteAlarm(),
     );
-    await sleep(6_000);
   } finally {
     clearInterval(pinger);
   }
+  await sleep(6_000);
   for (;;) {
     const message = await awake.client.next(200).catch(() => undefined);
     if (message === undefined) break;

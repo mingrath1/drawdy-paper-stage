@@ -191,8 +191,12 @@ export class Stage extends DurableObject<Env> {
         (await harness.snapshot(CommitReceipts, BACKGROUND_CONTEXT)) ??
           CommitReceipts.definition.initial(),
       );
-      // A deploy drops every socket, so the stored writer may be gone.
-      await this.#electWriter();
+      // A deploy drops every socket, so the stored writer may be gone. A writer whose socket hibernated with the
+      // object keeps its seat: the frame that woke the object may be its own, not yet counted as heard.
+      const writer = this.#control.writer.connectionId;
+      if (!this.#members().some(([, { connectionId }]) => connectionId === writer)) {
+        await this.#electWriter();
+      }
       await this.#refreshAlarm();
     } catch (error) {
       await harness.close(BACKGROUND_CONTEXT);
@@ -385,8 +389,11 @@ export class Stage extends DurableObject<Env> {
       return this.#disconnect(socket, "bad_message", "send hello first");
     }
     const joined = connection as Joined;
-    if (joined.member.role === "driver" && this.#control.writer.connectionId === null) {
-      // The seat empties when every driver went silent, so the first one heard from again takes it.
+    if (
+      joined.member.role === "driver" &&
+      joined.connectionId !== this.#control.writer.connectionId
+    ) {
+      // A driver just heard from is live, so it takes a seat that is empty or held by a writer gone silent.
       await this.#stageOperations.run("stage", () => this.#electWriter());
     }
 
@@ -422,6 +429,7 @@ export class Stage extends DurableObject<Env> {
     if (refusal !== undefined) {
       return this.#disconnect(socket, refusal.code, refusal.message, refusal.closeCode);
     }
+    await this.#refreshAlarm();
   }
 
   /** The token check, the per-person cap, joining, the welcome, and the election, with no stage change between them. */
@@ -483,24 +491,28 @@ export class Stage extends DurableObject<Env> {
   }
 
   /**
-   * Keeps the writer while it is joined and heard from in the last WRITER_TIMEOUT_MS, else hands the role to the
-   * longest-connected driver that is, or to nobody. Runs only inside a stage operation.
+   * Keeps the writer while its socket is open, unless it went unheard for WRITER_TIMEOUT_MS while another driver was
+   * heard from; then the longest-connected live driver takes the seat. A writer whose socket is gone hands the seat to
+   * that driver, or to nobody. Runs only inside a stage operation.
    */
   async #electWriter(): Promise<void> {
+    const now = Date.now();
     const current = this.#control.writer;
-    const drivers = this.#members()
-      .map(([, connection]) => connection)
-      .filter(isLiveDriver(Date.now()));
-    if (drivers.some((driver) => driver.connectionId === current.connectionId)) return;
-    const next = drivers.sort(byJoinOrder)[0];
-    if (next === undefined && current.connectionId === null) return;
+    const members = this.#members().map(([, connection]) => connection);
+    const seated = members.find(({ connectionId }) => connectionId === current.connectionId);
+    const live = members.filter(isLiveDriver(now)).sort(byJoinOrder);
+    const next = live.find(({ connectionId }) => connectionId !== current.connectionId);
+    if (seated !== undefined && (next === undefined || isLiveDriver(now)(seated))) return;
+    if (seated === undefined && next === undefined && current.connectionId === null) return;
 
     const writer: Writer = { connectionId: next?.connectionId ?? null, epoch: current.epoch + 1 };
     await this.#updateControl((control) => {
       control.writer = writer;
     });
     this.#broadcast({ type: "writer", writer });
-    if (next !== undefined) await this.#alarmBy(next.member.lastSeenAt + WRITER_TIMEOUT_MS);
+    if (next !== undefined && live.length > 1) {
+      await this.#alarmBy(next.member.lastSeenAt + WRITER_TIMEOUT_MS);
+    }
   }
 
   async #commit(
@@ -662,6 +674,7 @@ export class Stage extends DurableObject<Env> {
     if (member?.role === "driver") {
       await this.#stageOperations.run("stage", () => this.#electWriter());
     }
+    await this.#refreshAlarm();
   }
 
   async #disconnect(
@@ -769,14 +782,22 @@ export class Stage extends DurableObject<Env> {
     });
   }
 
-  /** When the sweep has work: a hello deadline, or the moment the writer's silence would cost it the seat. */
+  /**
+   * When the sweep has work: a hello deadline, or the moment the writer's silence would cost it the seat to another
+   * live driver. A lone writer keeps its seat however long it is silent, so it sets no deadline.
+   */
   #sweepDeadlines(): number[] {
+    const now = Date.now();
     const writer = this.#control.writer.connectionId;
+    const standby = this.#members().some(
+      ([, connection]) => connection.connectionId !== writer && isLiveDriver(now)(connection),
+    );
     return this.#openSockets().flatMap((socket) => {
       const { connectionId, connectedAt, member } = this.#connection(socket);
       if (member === null) return [connectedAt + HELLO_TIMEOUT_MS];
-      if (member.role === "driver" && connectionId === writer) {
-        return [member.lastSeenAt + WRITER_TIMEOUT_MS];
+      if (standby && member.role === "driver" && connectionId === writer) {
+        const deadline = member.lastSeenAt + WRITER_TIMEOUT_MS;
+        return deadline > now ? [deadline] : [];
       }
       return [];
     });

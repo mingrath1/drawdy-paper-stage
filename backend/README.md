@@ -26,7 +26,7 @@ Poses, cursors, and rate budgets are never stored. A view's last pose and a driv
 - A stage holds 64 sockets, and one `presenceId` holds 8 of them. A socket past either cap closes with 1013, which clients retry with backoff.
 - A socket that sends no `hello` within 10 s closes with 1008. An alarm sweep enforces it, so no timer keeps the object awake.
 - A socket may send 60 frames a second, and the elected writer 150. The Stage parses each frame and spends the budget as the frame arrives. Past the budget, poses and cursors drop silently, `scene.commit` and `asset.put` get an `ack` with error `limit` in order, and other frames drop with at most one `limit` error a second. Malformed and oversized frames close with their code whatever the budget. A socket with 200 frames still waiting closes with 1008.
-- A writer that sends no frame for 30 s loses its seat. The election runs again on every driver `hello`, every refused writer request, every alarm sweep, and the first frame from a driver while the seat is empty.
+- A writer that sends no frame for 30 s loses its seat to another driver heard from in that time. A lone writer keeps its seat however long it is silent, and loses it only when its socket closes. The election runs again on every driver `hello` and departure, every frame from a driver other than the writer, every refused writer request, and every alarm sweep. Waking from hibernation re-runs it only when the writer's socket is gone.
 
 ## Commands
 
