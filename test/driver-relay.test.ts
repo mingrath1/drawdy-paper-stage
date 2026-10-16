@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
     MAX_FRAME_CHARACTERS,
     MAX_ITEMS_PER_COMMIT,
+    MAX_ITEMS_PER_STAGE,
     type ClientMessage,
     type ServerMessage,
     type StageItem,
@@ -127,6 +128,30 @@ describe("planSync", () => {
         expect(messages[0]).toMatchObject({ upserts: [wall("move", 300), wall("new")], removes: ["gone"] });
         expect(messages[0]).not.toHaveProperty("frame");
         expect(messages[0]).not.toHaveProperty("reset");
+    });
+
+    it("removes before it adds, so no commit of a swap on a full stage passes the item cap", () => {
+        const before = Array.from({ length: MAX_ITEMS_PER_STAGE }, (_, i) => wall(`old${i}`, i));
+        const after = [
+            ...before.slice(150),
+            ...Array.from({ length: 150 }, (_, i) => wall(`new${i}`, i)),
+        ];
+        const stored = new Map(before.map((item) => [item.id, item]));
+        for (const message of commits(
+            planSync({
+                epoch: 1,
+                reset: false,
+                desired: desired(after),
+                committed: desired(before),
+                uploaded: new Set(),
+                nextRequestId: counter(),
+            }),
+        )) {
+            for (const id of message.removes) stored.delete(id);
+            for (const item of message.upserts) stored.set(item.id, item);
+            expect(stored.size).toBeLessThanOrEqual(MAX_ITEMS_PER_STAGE);
+        }
+        expect([...stored.keys()].sort()).toEqual(after.map((item) => item.id).sort());
     });
 
     it("sends nothing when nothing changed", () => {

@@ -64,9 +64,11 @@ export function planSync({ epoch, reset, desired, committed, uploaded, nextReque
     }
     if (!frameChanged && upserts.length === 0 && removes.length === 0) return puts;
 
+    // Removes go first: the server checks the item caps after every commit, and a swap on a full stage that adds
+    // before it removes would pass them partway through.
     const changes: ({ upsert: StageItem } | { remove: ElementId })[] = [
-        ...upserts.map((upsert) => ({ upsert })),
         ...removes.map((remove) => ({ remove })),
+        ...upserts.map((upsert) => ({ upsert })),
     ];
     const commits: WriterMessage[] = [];
     for (let i = 0; i === 0 || i < changes.length; i += MAX_ITEMS_PER_COMMIT) {
