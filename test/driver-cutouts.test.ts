@@ -1,14 +1,17 @@
+import type { DriverCommandIssuer, DriverCommandRequest, ModuleStyling } from "@drawdy/driver-protocol";
 import { createHash, randomBytes } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
     bytesToBase64,
     captureArea,
+    captureCutout,
     contentHash,
     cropInExport,
     CutoutCache,
     exportBounds,
     sha256Hex,
 } from "../src/cutouts";
+import { Host } from "../src/host";
 import type { BoardElement } from "../src/stage-model";
 
 const doodle: BoardElement = {
@@ -113,6 +116,41 @@ describe("exportBounds and cropInExport", () => {
     });
 });
 
+describe("captureCutout", () => {
+    const area = { x: 0, y: 0, width: 48, height: 28 };
+    const host = new Host(
+        ((request: DriverCommandRequest) =>
+            Promise.resolve({ ...request, res: { value: { png: new Blob(["not a png"]) } } })) as DriverCommandIssuer,
+        "d",
+        {} as ModuleStyling,
+    );
+
+    afterEach(() => vi.unstubAllGlobals());
+
+    it("reports a picture it cannot decode as failed instead of throwing", async () => {
+        vi.stubGlobal("createImageBitmap", () => Promise.reject(new Error("The source image could not be decoded.")));
+        await expect(captureCutout(host, area, [area])).resolves.toEqual({ ok: false, reason: "failed" });
+    });
+
+    it("reports a picture it cannot encode as failed instead of throwing", async () => {
+        const close = vi.fn();
+        vi.stubGlobal("createImageBitmap", () => Promise.resolve({ width: 88, height: 68, close }));
+        vi.stubGlobal(
+            "OffscreenCanvas",
+            class {
+                getContext() {
+                    return { drawImage() {} };
+                }
+                convertToBlob() {
+                    return Promise.reject(new Error("canvas is too large"));
+                }
+            },
+        );
+        await expect(captureCutout(host, area, [area])).resolves.toEqual({ ok: false, reason: "failed" });
+        expect(close).toHaveBeenCalledOnce();
+    });
+});
+
 describe("bytesToBase64", () => {
     it("matches Node's encoding for a 2 MB buffer without overflowing the stack", () => {
         const bytes = new Uint8Array(randomBytes(2 * 1024 * 1024 + 7));
@@ -147,10 +185,34 @@ describe("CutoutCache", () => {
         expect(cache.get("d", "v2")).toBeUndefined();
     });
 
-    it("remembers a failure so an unchanged drawing is not retried", () => {
+    it("keeps a too-big capture, which comes out the same until the drawing changes", () => {
         const cache = new CutoutCache();
         cache.set("d", "v1", { ok: false, reason: "too_big" });
         expect(cache.get("d", "v1")).toEqual({ ok: false, reason: "too_big" });
+    });
+
+    it("retries a failed capture after a backoff that grows and stays bounded", () => {
+        let now = 0;
+        const cache = new CutoutCache(() => now);
+        const waits: number[] = [];
+        for (let i = 0; i < 8; i++) {
+            cache.set("d", "v1", { ok: false, reason: "failed" });
+            const pending = cache.get("d", "v1");
+            if (!pending || !("retryInMs" in pending))
+                throw new Error(`expected a backoff, got ${JSON.stringify(pending)}`);
+            waits.push(pending.retryInMs);
+            now += pending.retryInMs - 1;
+            expect(cache.get("d", "v1")).toEqual({ retryInMs: 1 });
+            now += 1;
+            expect(cache.get("d", "v1")).toBeUndefined();
+        }
+        expect(waits).toEqual([1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000]);
+    });
+
+    it("captures a changed drawing at once, even while its old version backs off", () => {
+        const cache = new CutoutCache(() => 0);
+        cache.set("d", "v1", { ok: false, reason: "failed" });
+        expect(cache.get("d", "v2")).toBeUndefined();
     });
 
     it("forgets elements that left the stage", () => {

@@ -180,8 +180,9 @@ export async function captureCutout(host: Host, area: Rect, board: readonly Rect
     const bounds = exportBounds(area, board);
     const shot = await host.call("command:scene:capture-screenshot", { area });
     if (!shot.ok || !bounds) return { ok: false, reason: "failed" };
-    const bitmap = await createImageBitmap(shot.value.png);
+    let bitmap: ImageBitmap | null = null;
     try {
+        bitmap = await createImageBitmap(shot.value.png);
         const crop = cropInExport(area, bounds, bitmap);
         if (!crop) {
             console.warn(`[paper-stage] export ${bitmap.width}x${bitmap.height} does not match bounds`, bounds);
@@ -195,22 +196,45 @@ export async function captureCutout(host: Host, area: Rect, board: readonly Rect
             }
         }
         return { ok: false, reason: "too_big" };
+    } catch (err) {
+        console.warn("[paper-stage] could not cut out a capture", err);
+        return { ok: false, reason: "failed" };
     } finally {
-        bitmap.close();
+        bitmap?.close();
     }
 }
 
-/** Captures keyed by element and content hash. A failed capture is remembered so it is not retried until the element changes. */
-export class CutoutCache {
-    private readonly entries = new Map<ElementId, { hash: string; result: CaptureResult }>();
+const RETRY_MS = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
 
-    get(id: ElementId, hash: string): CaptureResult | undefined {
+type CacheEntry = { hash: string } & ({ result: CaptureResult } | { failures: number; retryAt: number });
+
+/**
+ * Captures keyed by element and content hash. A too-big capture is kept, since it comes out the same until the
+ * drawing changes. A failed one may be a passing hiccup, so it is retried with a growing, bounded backoff.
+ */
+export class CutoutCache {
+    private readonly entries = new Map<ElementId, CacheEntry>();
+
+    constructor(private readonly now: () => number = Date.now) {}
+
+    /** The kept capture, how long until a failed one may be retried, or undefined to capture now. */
+    get(id: ElementId, hash: string): CaptureResult | { retryInMs: number } | undefined {
         const entry = this.entries.get(id);
-        return entry?.hash === hash ? entry.result : undefined;
+        if (entry?.hash !== hash) return undefined;
+        if ("result" in entry) return entry.result;
+        const wait = entry.retryAt - this.now();
+        return wait > 0 ? { retryInMs: wait } : undefined;
     }
 
     set(id: ElementId, hash: string, result: CaptureResult): void {
-        this.entries.set(id, { hash, result });
+        if (result.ok || result.reason === "too_big") {
+            this.entries.set(id, { hash, result });
+            return;
+        }
+        const previous = this.entries.get(id);
+        const failures = previous?.hash === hash && "failures" in previous ? previous.failures + 1 : 1;
+        const retryAt = this.now() + RETRY_MS[Math.min(failures, RETRY_MS.length) - 1];
+        this.entries.set(id, { hash, failures, retryAt });
     }
 
     retain(ids: ReadonlySet<ElementId>): void {

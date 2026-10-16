@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
     MAX_FRAME_CHARACTERS,
     MAX_ITEMS_PER_COMMIT,
+    MAX_ITEMS_PER_STAGE,
     type ClientMessage,
     type ServerMessage,
     type StageItem,
@@ -127,6 +128,27 @@ describe("planSync", () => {
         expect(messages[0]).toMatchObject({ upserts: [wall("move", 300), wall("new")], removes: ["gone"] });
         expect(messages[0]).not.toHaveProperty("frame");
         expect(messages[0]).not.toHaveProperty("reset");
+    });
+
+    it("removes before it adds, so no commit of a swap on a full stage passes the item cap", () => {
+        const before = Array.from({ length: MAX_ITEMS_PER_STAGE }, (_, i) => wall(`old${i}`, i));
+        const after = [...before.slice(150), ...Array.from({ length: 150 }, (_, i) => wall(`new${i}`, i))];
+        const stored = new Map(before.map((item) => [item.id, item]));
+        for (const message of commits(
+            planSync({
+                epoch: 1,
+                reset: false,
+                desired: desired(after),
+                committed: desired(before),
+                uploaded: new Set(),
+                nextRequestId: counter(),
+            }),
+        )) {
+            for (const id of message.removes) stored.delete(id);
+            for (const item of message.upserts) stored.set(item.id, item);
+            expect(stored.size).toBeLessThanOrEqual(MAX_ITEMS_PER_STAGE);
+        }
+        expect([...stored.keys()].sort()).toEqual(after.map((item) => item.id).sort());
     });
 
     it("sends nothing when nothing changed", () => {
@@ -294,6 +316,20 @@ describe("Relay", () => {
         return { relay, socket };
     }
 
+    function elect(socket: FakeSocket, epoch = 1) {
+        socket.receive({
+            type: "welcome",
+            v: 2,
+            connectionId: "c1",
+            writer: { connectionId: "c1", epoch },
+            snapshot,
+            walkers: [],
+        });
+    }
+
+    const sentCommits = (socket: FakeSocket) =>
+        socket.sent.filter((m) => m.type === "scene.commit") as Extract<ClientMessage, { type: "scene.commit" }>[];
+
     it("says hello as a driver to the stage's socket URL", () => {
         const { socket } = connect();
         expect(socket.url).toBe("wss://stage.example/api/stages/s1");
@@ -408,6 +444,15 @@ describe("Relay", () => {
         expect(socket.sent.at(-1)).toEqual({ type: "cursors", epoch: 5, cursors: [{ ...participant, x: 1, y: 2 }] });
     });
 
+    it("sends the newest cursors as soon as it becomes the writer", () => {
+        const { relay, socket } = connect();
+        const cursors = [{ ...participant, x: 1, y: 2 }];
+        relay.sendCursors(cursors);
+        expect(socket.sent.map((m) => m.type)).toEqual(["hello"]);
+        elect(socket, 4);
+        expect(socket.sent.filter((m) => m.type === "cursors")).toEqual([{ type: "cursors", epoch: 4, cursors }]);
+    });
+
     it("stops for good on a bad token", () => {
         const { socket } = connect();
         socket.drop(4401);
@@ -430,7 +475,7 @@ describe("Relay", () => {
     });
 
     it("passes walkers on and reports rejected commits", () => {
-        const { socket } = connect();
+        const { relay, socket } = connect();
         const walker = { connectionId: "v1", participant, pose: { x: 1, y: 2, heading: 0, pitch: 0 } };
         socket.receive({
             type: "welcome",
@@ -441,10 +486,46 @@ describe("Relay", () => {
             walkers: [walker],
         });
         socket.receive({ type: "walker.left", connectionId: "v1" });
-        socket.receive({ type: "ack", requestId: "r1", ok: false, error: "bad_message", message: "bad item" });
+        relay.commit(1, desired([wall("w")]));
+        const sent = socket.sent.at(-1) as Extract<ClientMessage, { type: "scene.commit" }>;
+        socket.receive({
+            type: "ack",
+            requestId: sent.requestId,
+            ok: false,
+            error: "bad_message",
+            message: "bad item",
+        });
         expect(handlers.walker).toHaveBeenCalledWith(walker);
         expect(handlers.walkerLeft).toHaveBeenCalledWith("v1");
         expect(handlers.rejected).toHaveBeenCalledWith("bad_message", "bad item");
+    });
+
+    it("ignores a late ack for a request it no longer waits on, so it keeps writing after re-election", () => {
+        const { relay, socket } = connect();
+        socket.receive({
+            type: "welcome",
+            v: 2,
+            connectionId: "c1",
+            writer: { connectionId: "c1", epoch: 1 },
+            snapshot,
+            walkers: [],
+        });
+        relay.commit(1, desired([wall("w")]));
+        const first = socket.sent.at(-1) as Extract<ClientMessage, { type: "scene.commit" }>;
+        vi.advanceTimersByTime(ACK_TIMEOUT_MS + 1_000);
+        socket.receive({ type: "writer", writer: { connectionId: "c1", epoch: 2 } });
+        socket.receive({
+            type: "ack",
+            requestId: first.requestId,
+            ok: false,
+            error: "stale_epoch",
+            message: "epoch 1 is over",
+        });
+        expect(handlers.rejected).not.toHaveBeenCalled();
+        expect(relay.writerEpoch).toBe(2);
+        relay.commit(2, desired([wall("w")]));
+        vi.advanceTimersByTime(SEND_GAP_MS);
+        expect(socket.sent.at(-1)).toMatchObject({ type: "scene.commit", epoch: 2, reset: true, upserts: [wall("w")] });
     });
 
     it("pings every 10 seconds", () => {
@@ -461,53 +542,116 @@ describe("Relay", () => {
         expect(socket.sent.at(-1)).toMatchObject({ type: "ping" });
     });
 
-    it("resends an unanswered commit under its original requestId after 5 seconds", () => {
+    it("never resends an unanswered commit; after the ack timeout it resyncs the newest scene", () => {
         const { relay, socket } = connect();
-        socket.receive({
-            type: "welcome",
-            v: 2,
-            connectionId: "c1",
-            writer: { connectionId: "c1", epoch: 1 },
-            snapshot,
-            walkers: [],
-        });
+        elect(socket);
         relay.commit(1, desired([wall("w")]));
-        const first = socket.sent.at(-1) as Extract<ClientMessage, { type: "scene.commit" }>;
+        vi.advanceTimersByTime(SEND_GAP_MS);
+        relay.commit(1, desired([wall("w", 50)]));
+        vi.advanceTimersByTime(SEND_GAP_MS);
+        const unanswered = sentCommits(socket).map((m) => m.requestId);
+        expect(unanswered).toHaveLength(2);
         vi.advanceTimersByTime(ACK_TIMEOUT_MS + 1_000);
-        const commits = socket.sent.filter((m) => m.type === "scene.commit");
-        expect(commits).toHaveLength(2);
-        expect(commits[1]).toEqual(first);
-        socket.receive({ type: "ack", requestId: first.requestId, ok: true, revision: 1 });
-        vi.advanceTimersByTime(ACK_TIMEOUT_MS * 3);
-        expect(socket.sent.filter((m) => m.type === "scene.commit")).toHaveLength(2);
+        const later = sentCommits(socket).slice(2);
+        expect(later.map((m) => m.requestId)).not.toContain(unanswered[0]);
+        expect(later.map((m) => m.requestId)).not.toContain(unanswered[1]);
+        expect(later).toMatchObject([{ type: "scene.commit", epoch: 1, reset: true, upserts: [wall("w", 50)] }]);
     });
 
-    it("resyncs when a later ack shows the server dropped a commit", () => {
+    it("drops the commits still waiting when one is rejected, and resets on the next sync", () => {
         const { relay, socket } = connect();
+        elect(socket);
+        relay.commit(1, desired([wall("w")]));
+        relay.commit(1, desired([wall("w"), wall("v")]));
+        const [first] = sentCommits(socket);
+        socket.receive({ type: "ack", requestId: first.requestId, ok: false, error: "bad_message", message: "bad" });
+        vi.advanceTimersByTime(ACK_TIMEOUT_MS * 2);
+        expect(sentCommits(socket)).toHaveLength(1);
+        relay.commit(1, desired([wall("w"), wall("v")]));
+        vi.advanceTimersByTime(SEND_GAP_MS);
+        expect(sentCommits(socket).slice(1)).toMatchObject([
+            { type: "scene.commit", reset: true, upserts: [wall("w"), wall("v")] },
+        ]);
+    });
+
+    it("keeps only the newest board while a batch drains, then sends one diff with its uploads first", () => {
+        const { relay, socket } = connect();
+        elect(socket);
+        const shots = Array.from({ length: 10 }, (_, i) => cutout(`c${i}`, `h${i}`));
+        const late = cutout("late", "h-late");
+        const board = (x: number, extra: typeof shots = []) =>
+            desired(
+                [wall("w", x), ...[...shots, ...extra].map((shot) => shot.item)],
+                [...shots, ...extra].map((shot) => shot.asset),
+            );
+        relay.commit(1, board(10));
+        for (let x = 11; x <= 19; x++) {
+            vi.advanceTimersByTime(SEND_GAP_MS);
+            relay.commit(1, board(x, x >= 15 ? [late] : []));
+        }
+        vi.advanceTimersByTime(SEND_GAP_MS * 20);
+        const writes = socket.sent.filter((m) => m.type === "asset.put" || m.type === "scene.commit");
+        expect(writes.map((m) => m.type)).toEqual([
+            ...shots.map(() => "asset.put"),
+            "scene.commit",
+            "asset.put",
+            "scene.commit",
+        ]);
+        expect(writes.at(-2)).toMatchObject({ hash: "h-late" });
+        expect(writes.at(-1)).toMatchObject({ upserts: [wall("w", 19), late.item], removes: [] });
+    });
+
+    it("takes a limit ack as a stage cap: reports it, never replays the commit, and resets on the next sync", () => {
+        const { relay, socket } = connect();
+        elect(socket);
+        relay.commit(1, desired([wall("w")]));
+        const [first] = sentCommits(socket);
         socket.receive({
-            type: "welcome",
-            v: 2,
-            connectionId: "c1",
-            writer: { connectionId: "c1", epoch: 1 },
-            snapshot,
-            walkers: [],
+            type: "ack",
+            requestId: first.requestId,
+            ok: false,
+            error: "limit",
+            message: "a stage holds at most 400 items",
         });
+        expect(handlers.rejected).toHaveBeenCalledWith("limit", "a stage holds at most 400 items");
+        vi.advanceTimersByTime(20_000);
+        expect(sentCommits(socket)).toHaveLength(1);
+        relay.commit(1, desired([wall("w")]));
+        vi.advanceTimersByTime(SEND_GAP_MS);
+        expect(sentCommits(socket).slice(1)).toMatchObject([{ reset: true, upserts: [wall("w")] }]);
+    });
+
+    it("pauses for a second when the server says it is dropping this socket's messages", () => {
+        const { relay, socket } = connect();
+        elect(socket);
+        const shots = ["h1", "h2", "h3"].map((hash, i) => cutout(`c${i}`, hash));
+        relay.commit(
+            1,
+            desired(
+                shots.map((shot) => shot.item),
+                shots.map((shot) => shot.asset),
+            ),
+        );
+        const writes = () => socket.sent.filter((m) => m.type === "asset.put" || m.type === "scene.commit").length;
+        expect(writes()).toBe(1);
+        socket.receive({ type: "error", code: "limit", message: "more than 60 messages per second; dropping" });
+        vi.advanceTimersByTime(1_000 - 1);
+        expect(writes()).toBe(1);
+        vi.advanceTimersByTime(1);
+        expect(writes()).toBe(2);
+    });
+
+    it("resyncs the newest scene when a later ack shows the server dropped a commit", () => {
+        const { relay, socket } = connect();
+        elect(socket);
         relay.commit(1, desired([wall("w")]));
         relay.commit(1, desired([wall("w", 50)]));
         vi.advanceTimersByTime(SEND_GAP_MS);
-        const [dropped, landed] = socket.sent.filter((m) => m.type === "scene.commit") as Extract<
-            ClientMessage,
-            { type: "scene.commit" }
-        >[];
-        handlers.syncNeeded.mockClear();
+        const [dropped, landed] = sentCommits(socket);
         socket.receive({ type: "ack", requestId: landed.requestId, ok: true, revision: 1 });
-        expect(handlers.syncNeeded).toHaveBeenCalledOnce();
-        relay.commit(1, desired([wall("w", 50)]));
         vi.advanceTimersByTime(SEND_GAP_MS);
         expect(socket.sent.at(-1)).toMatchObject({ type: "scene.commit", reset: true, upserts: [wall("w", 50)] });
-        expect(socket.sent.filter((m) => m.type === "scene.commit" && m.requestId === dropped.requestId)).toHaveLength(
-            1,
-        );
+        expect(sentCommits(socket).filter((m) => m.requestId === dropped.requestId)).toHaveLength(1);
     });
 });
 
@@ -553,73 +697,31 @@ describe("Outbox", () => {
         expect(outbox.take()).toBeNull();
     });
 
-    it("puts unanswered messages back in order after the ack timeout", () => {
+    it("gives up on unanswered messages after the ack timeout: uploads go back in order, commits are lost", () => {
         const outbox = new Outbox(clock);
-        outbox.push([commit("a"), commit("b")]);
-        drain(outbox);
-        now += SEND_GAP_MS;
-        drain(outbox);
-        now += ACK_TIMEOUT_MS - SEND_GAP_MS - 1;
-        expect(outbox.retryStale()).toBe(false);
+        outbox.push([put("a"), commit("c"), put("b")]);
+        for (let i = 0; i < 3; i++, now += SEND_GAP_MS) drain(outbox);
+        now += ACK_TIMEOUT_MS - 3 * SEND_GAP_MS - 1;
+        expect(outbox.expire()).toBeNull();
         now += 1;
-        expect(outbox.retryStale()).toBe(true);
+        expect(outbox.expire()).toEqual({ lost: true });
         expect(drain(outbox)).toEqual(["a"]);
         now += SEND_GAP_MS;
         expect(drain(outbox)).toEqual(["b"]);
+        now += SEND_GAP_MS;
+        expect(outbox.take()).toBeNull();
     });
 
     it("re-queues a dropped upload but asks for a resync after a dropped commit", () => {
         const outbox = new Outbox(clock);
         outbox.push([put("p"), commit("c1"), commit("c2")]);
         for (let i = 0; i < 3; i++, now += SEND_GAP_MS) drain(outbox);
-        expect(outbox.settle("c1", false)).toBe(false);
+        expect(outbox.settle("c1")?.lost).toBe(false);
         expect(drain(outbox)).toEqual(["p"]);
 
         const second = new Outbox(clock);
         second.push([commit("c1"), commit("c2")]);
         for (let i = 0; i < 2; i++, now += SEND_GAP_MS) drain(second);
-        expect(second.settle("c2", false)).toBe(true);
-    });
-
-    it("replays a rate-limited commit under its requestId after a backoff", () => {
-        const outbox = new Outbox(clock);
-        outbox.push([commit("c1"), put("p")]);
-        for (let i = 0; i < 2; i++, now += SEND_GAP_MS) drain(outbox);
-        expect(outbox.settle("c1", true)).toBe(false);
-        expect(outbox.take()).toEqual({ waitMs: 1_000 });
-        now += 1_000;
-        expect(drain(outbox)).toEqual(["c1"]);
-        now += SEND_GAP_MS;
-        expect(drain(outbox)).toEqual(["p"]);
-    });
-
-    it("resyncs instead of replaying a limited commit that a newer commit may overtake", () => {
-        const outbox = new Outbox(clock);
-        outbox.push([commit("c1"), put("p"), commit("c2")]);
-        for (let i = 0; i < 3; i++, now += SEND_GAP_MS) drain(outbox);
-        expect(outbox.settle("c1", true)).toBe(true);
-        now += 1_000;
-        expect(drain(outbox)).toEqual(["p"]);
-        now += SEND_GAP_MS;
-        expect(outbox.take()).toBeNull();
-    });
-
-    it("backs off longer on repeated limits and resets after a success", () => {
-        const outbox = new Outbox(clock);
-        outbox.push([commit("c1")]);
-        drain(outbox);
-        outbox.settle("c1", true);
-        now += 1_000;
-        drain(outbox);
-        outbox.settle("c1", true);
-        expect(outbox.take()).toEqual({ waitMs: 2_000 });
-        now += 2_000;
-        drain(outbox);
-        outbox.settle("c1", false);
-        outbox.push([commit("c2")]);
-        now += SEND_GAP_MS;
-        drain(outbox);
-        outbox.settle("c2", true);
-        expect(outbox.take()).toEqual({ waitMs: 1_000 });
+        expect(second.settle("c2")?.lost).toBe(true);
     });
 });

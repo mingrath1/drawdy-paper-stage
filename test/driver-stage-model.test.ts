@@ -48,6 +48,14 @@ describe("belongsToStage", () => {
     it("counts an element whose center lies inside the frame", () => {
         expect(belongsToStage(el("e", { x: 880, y: 540, width: 30, height: 30 }), FRAME_ID, rect)).toBe(true);
     });
+    it("leaves out an element that belongs to another frame, even inside the stage", () => {
+        expect(belongsToStage(el("e", { frameId: "other-frame", x: 100, y: 100 }), FRAME_ID, rect)).toBe(false);
+    });
+    it("tests the center of an element whose frameId was cleared", () => {
+        expect(
+            belongsToStage(el("e", { frameId: null, x: 100, y: 100 } as Partial<BoardElement>), FRAME_ID, rect),
+        ).toBe(true);
+    });
     it("leaves out an element whose center lies outside the frame", () => {
         expect(belongsToStage(el("e", { x: 890, y: 100, width: 40, height: 20 }), FRAME_ID, rect)).toBe(false);
     });
@@ -114,7 +122,8 @@ describe("projectStage", () => {
                     [140, 120],
                 ],
             }),
-            el("triangle", { type: "path" }),
+            el("triangle", { type: "path", x: 300 }),
+            el("sticker", { type: "component" }),
             el("outside", { type: "path", componentType: "rect", x: 2000 }),
         );
         const projection = projectStage(state)!;

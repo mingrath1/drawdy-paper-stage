@@ -64,9 +64,11 @@ export function planSync({ epoch, reset, desired, committed, uploaded, nextReque
     }
     if (!frameChanged && upserts.length === 0 && removes.length === 0) return puts;
 
+    // Removes go first: the server checks the item caps after every commit, and a swap on a full stage that adds
+    // before it removes would pass them partway through.
     const changes: ({ upsert: StageItem } | { remove: ElementId })[] = [
-        ...upserts.map((upsert) => ({ upsert })),
         ...removes.map((remove) => ({ remove })),
+        ...upserts.map((upsert) => ({ upsert })),
     ];
     const commits: WriterMessage[] = [];
     for (let i = 0; i === 0 || i < changes.length; i += MAX_ITEMS_PER_COMMIT) {
@@ -144,28 +146,33 @@ export class WriterSession {
 
 export const SEND_GAP_MS = 50;
 export const ACK_TIMEOUT_MS = 5_000;
-const LIMIT_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000];
+const THROTTLE_MS = 1_000;
 
 const isCommit = (message: WriterMessage) => message.type === "scene.commit";
 const isUpload = (message: WriterMessage) => message.type === "asset.put";
 
 /**
  * Writer messages on their way to the Stage object. The server drops a socket's messages past 60 a second, so the
- * outbox paces them, and resends unanswered or rate-limited ones in order under their original requestIds.
+ * outbox paces them.
  *
- * Commits carry whole items, so replaying an old commit after a newer one landed would undo the newer one. When a
- * replay cannot keep that order, `settle` asks the writer to resync instead.
+ * Commits carry whole items, and the server answers a resent requestId from its receipt without applying it again, so
+ * a resent old commit could land after a newer one and win for good. A commit that may be lost is therefore never
+ * resent: the outbox reports it lost and the writer resyncs. Uploads are content-addressed, so they are resent as is.
  */
 export class Outbox {
     private queue: WriterMessage[] = [];
     private inFlight: { message: WriterMessage; sentAt: number }[] = [];
     private nextSendAt = 0;
-    private limits = 0;
 
     constructor(private readonly now: () => number = Date.now) {}
 
     push(messages: readonly WriterMessage[]): void {
         this.queue.push(...messages);
+    }
+
+    /** True once every queued message went out. */
+    get drained(): boolean {
+        return this.queue.length === 0;
     }
 
     /** The next message pacing allows, how long until it may go, or null when nothing waits. */
@@ -180,52 +187,53 @@ export class Outbox {
     }
 
     /**
-     * Settles an ack and returns true when the writer must resync. The server answers a socket in order, so anything
-     * sent before the acked message and still unanswered was dropped.
+     * Settles an ack and returns the message it answers, with `lost` set when a commit was lost. The server answers a
+     * socket in order, so anything sent before the acked message and still unanswered was dropped. Returns null for
+     * an ack this outbox no longer waits on: a second answer to a resent upload, or one for a message it gave up on.
      */
-    settle(requestId: string, limited: boolean): boolean {
+    settle(requestId: string): { message: WriterMessage; lost: boolean } | null {
         const index = this.inFlight.findIndex((entry) => entry.message.requestId === requestId);
-        if (index < 0) return false;
+        if (index < 0) return null;
         const dropped = this.inFlight.splice(0, index).map((entry) => entry.message);
         const answered = this.inFlight.shift()!.message;
-        let resync = dropped.some(isCommit);
-        const replay: WriterMessage[] = dropped.filter(isUpload);
-        if (limited) {
-            const later = this.inFlight.splice(0).map((entry) => entry.message);
-            if (isUpload(answered) || !later.some(isCommit)) replay.push(answered, ...later);
-            else {
-                resync = true;
-                replay.push(...[answered, ...later].filter(isUpload));
-            }
-            const backoff = LIMIT_BACKOFF_MS[Math.min(this.limits++, LIMIT_BACKOFF_MS.length - 1)];
-            this.nextSendAt = Math.max(this.nextSendAt, this.now() + backoff);
-        } else {
-            this.limits = 0;
-        }
-        this.queue.unshift(...replay);
-        return resync;
+        this.queue.unshift(...dropped.filter(isUpload));
+        return { message: answered, lost: dropped.some(isCommit) };
     }
 
-    /** Once the oldest unanswered message has waited too long, puts every unanswered message back at the front. */
-    retryStale(): boolean {
+    /** The server is dropping this socket's messages, and refills its budget within a second. */
+    throttle(): void {
+        this.nextSendAt = Math.max(this.nextSendAt, this.now() + THROTTLE_MS);
+    }
+
+    /**
+     * Once the oldest unanswered message has waited too long, gives up on every unanswered one: uploads go back to the
+     * front of the queue and commits are dropped. Returns null while nothing has expired.
+     */
+    expire(): { lost: boolean } | null {
         const oldest = this.inFlight[0];
-        if (!oldest || this.now() - oldest.sentAt < ACK_TIMEOUT_MS) return false;
-        this.queue.unshift(...this.inFlight.map((entry) => entry.message));
+        if (!oldest || this.now() - oldest.sentAt < ACK_TIMEOUT_MS) return null;
+        const unanswered = this.inFlight.map((entry) => entry.message);
         this.inFlight = [];
-        return true;
+        this.queue.unshift(...unanswered.filter(isUpload));
+        return { lost: unanswered.some(isCommit) };
+    }
+
+    /** Drops every commit not yet answered. Uploads stay, since the writer already counts them as stored. */
+    dropCommits(): void {
+        this.queue = this.queue.filter(isUpload);
+        this.inFlight = this.inFlight.filter((entry) => isUpload(entry.message));
     }
 
     clear(): void {
         this.queue = [];
         this.inFlight = [];
-        this.limits = 0;
     }
 }
 
 export type RelayHandlers = {
     /** The first `welcome` on this relay. The stage token is registered from here on. */
     welcomed(): void;
-    /** This driver became the writer, or a rejected commit needs a full resync. */
+    /** This driver became the writer. */
     syncNeeded(): void;
     walker(walker: Walker): void;
     walkerLeft(connectionId: string): void;
@@ -259,6 +267,12 @@ export class Relay {
     private lastPing = 0;
     private stopped = false;
     private storedAssets = new Set<AssetHash>();
+    /** The newest board this writer was asked to commit, which a resync replaces the stored stage with. */
+    private desired: DesiredStage | null = null;
+    /** `desired` changed since the last plan. */
+    private dirty = false;
+    /** Presence fires only on change, so a newly elected writer relays the last list it heard. */
+    private cursors: Cursor[] | null = null;
 
     constructor(
         private readonly backendUrl: string,
@@ -286,18 +300,37 @@ export class Relay {
     /** Sends what changed on the board, if this connection is still the writer for `epoch`. */
     commit(epoch: number, desired: DesiredStage): void {
         if (epoch !== this.writerEpoch) return;
-        this.outbox.push(this.session.plan(epoch, desired));
+        this.desired = desired;
+        this.dirty = true;
+        this.pump();
+    }
+
+    /** A commit may be lost, so the commits behind it build on a stage that may not exist. Replace the whole stage. */
+    private resync(): void {
+        this.outbox.dropCommits();
+        this.session.resync();
+        this.dirty = true;
         this.pump();
     }
 
     sendCursors(cursors: Cursor[]): void {
+        this.cursors = cursors;
         const epoch = this.writerEpoch;
         if (epoch !== null) this.send({ type: "cursors", epoch, cursors });
     }
 
     private pump(): void {
         if (this.pumpTimer) return;
-        for (let next = this.outbox.take(); next; next = this.outbox.take()) {
+        for (;;) {
+            // A new plan waits until the last batch went out, so a board that changes faster than the outbox drains
+            // coalesces into its newest state instead of queueing every step.
+            const epoch = this.writerEpoch;
+            if (this.dirty && this.outbox.drained && epoch !== null && this.desired) {
+                this.dirty = false;
+                this.outbox.push(this.session.plan(epoch, this.desired));
+            }
+            const next = this.outbox.take();
+            if (!next) return;
             if ("waitMs" in next) {
                 this.pumpTimer = setTimeout(() => {
                     this.pumpTimer = null;
@@ -368,14 +401,15 @@ export class Relay {
                 this.applyWriter(entry, message.writer);
                 return;
             case "ack": {
-                const limited = !message.ok && message.error === "limit";
-                if (this.outbox.settle(message.requestId, limited)) {
-                    this.session.resync();
-                    this.handlers.syncNeeded();
-                }
-                if (!message.ok && !limited) {
-                    if (!this.session.onRejected(message.error)) this.outbox.clear();
+                const settled = this.outbox.settle(message.requestId);
+                // A late answer can carry a stale_epoch from before a re-election; it says nothing about now.
+                if (!settled || settled.message.epoch !== this.session.epoch) return;
+                if (!message.ok) {
+                    if (this.session.onRejected(message.error)) this.outbox.dropCommits();
+                    else this.outbox.clear();
                     this.handlers.rejected(message.error, message.message);
+                } else if (settled.lost) {
+                    return this.resync();
                 }
                 this.pump();
                 return;
@@ -391,6 +425,8 @@ export class Relay {
                 this.handlers.walkerLeft(message.connectionId);
                 return;
             case "error":
+                // Throttling drops a message without an ack; an ack with error `limit` is a stage cap instead.
+                if (message.code === "limit") this.outbox.throttle();
                 console.warn(`[paper-stage] stage server error ${message.code}: ${message.message}`);
                 return;
             case "cursors":
@@ -408,7 +444,9 @@ export class Relay {
         const epoch = this.session.epoch;
         const becameWriter = this.session.onWriter(writer, entry.connectionId, this.storedAssets);
         if (this.session.epoch !== epoch) this.outbox.clear();
-        if (becameWriter) this.handlers.syncNeeded();
+        if (!becameWriter) return;
+        if (this.cursors) this.sendCursors(this.cursors);
+        this.handlers.syncNeeded();
     }
 
     private tick(): void {
@@ -421,7 +459,9 @@ export class Relay {
             this.lastPing = now;
             this.send({ type: "ping", t: now });
         }
-        if (this.outbox.retryStale()) this.pump();
+        const expired = this.outbox.expire();
+        if (expired?.lost) this.resync();
+        else if (expired) this.pump();
     }
 
     private drop(): void {

@@ -6,18 +6,28 @@ import {
     type AssetHash,
     type ElementId,
     type Participant,
-    type Pose,
+    type Rect,
     type StageItem,
 } from "../shared/protocol";
 import { BACKEND_URL } from "./config";
-import { captureCutout, CutoutCache, turnedBox, type CutoutAsset } from "./cutouts";
+import { captureCutout, CutoutCache, exportBounds, turnedBox, type CutoutAsset } from "./cutouts";
 import { Host, type CommandType, type RequestArgs } from "./host";
-import { cursorsOf, participantOf, RestWatch, throttle } from "./presence";
+import { cursorsOf, participantOf, throttle } from "./presence";
 import { Relay } from "./relay";
 import { findFreeSpot, findStageFrame, newStageMeta, STAGE_SIZE, starterStage, type StageMeta } from "./stage-frame";
-import { ELEMENT_PROPERTIES, projectStage, rectOf, reduceScene, type SceneEvent, type SceneState } from "./stage-model";
+import {
+    ELEMENT_PROPERTIES,
+    projectStage,
+    rectOf,
+    reduceScene,
+    stageItemOf,
+    type BoardItem,
+    type SceneEvent,
+    type SceneState,
+} from "./stage-model";
 import { buildViewHtml } from "./view-html";
 import { CLOSE_ID, VIEW_ID, viewLayout, viewSchema } from "./view-window";
+import { WalkerMarkers } from "./walkers";
 
 const BUTTON_ID = "paper-stage-button";
 const ICON =
@@ -26,6 +36,8 @@ const STARTER_COLORS = { ink: "#1e1e1e", wall: "#e8dcc4", pawn: "#e8590c" };
 /** At most 10 commits per second while things move; each commit is persisted. */
 const FLUSH_MS = 100;
 const RETRY_MS = 2_000;
+/** A window drag fires many resizes; the view is refitted once they stop. */
+const RESIZE_SETTLE_MS = 200;
 const WELCOME_WAIT_MS = 8_000;
 const SCENE_TOPICS = [
     "subscription:scene:elements-added",
@@ -39,9 +51,10 @@ type Stage = {
     participant: Participant;
     scene: SceneState;
     relay: Relay;
-    rest: RestWatch;
+    walkers: WalkerMarkers;
     cutouts: CutoutCache;
     sendCursors: (users: readonly CollaborationUserPresence[]) => void;
+    viewHtml: string;
     viewWanted: boolean;
     viewOpen: boolean;
     dropped: { cutouts: number; items: number; tooBig: number };
@@ -84,12 +97,7 @@ export const onEvent: DriverModule["onEvent"] = async (event) => {
             if (state.phase === "running") state.stage.sendCursors(event.body.users);
             return;
         case "subscription:dom:screen-resized":
-            if (state.phase === "running" && state.stage.viewOpen) {
-                await host.run("command:dom:move-floating-element", {
-                    domId: VIEW_ID,
-                    position: viewLayout(event.body).position,
-                });
-            }
+            if (state.phase === "running") onResize(state.stage, event.body);
             return;
     }
 };
@@ -156,8 +164,8 @@ async function openStage(): Promise<Stage | null> {
         relay: new Relay(BACKEND_URL, frame.meta.stageId, frame.meta.token, participant, {
             welcomed: () => syncView(stage),
             syncNeeded: () => scheduleFlush(),
-            walker: (walker) => stage.rest.walker(walker),
-            walkerLeft: (connectionId) => stage.rest.left(connectionId),
+            walker: (walker) => stage.walkers.show(walker),
+            walkerLeft: (connectionId) => stage.walkers.leave(connectionId),
             rejected: (error, message) => {
                 console.warn(`[paper-stage] commit rejected: ${error} ${message}`);
                 scheduleFlush(RETRY_MS);
@@ -172,15 +180,23 @@ async function openStage(): Promise<Stage | null> {
                         : ["This version of Paper Stage is out of date. Update the extension and try again."],
                 ),
         }),
-        rest: new RestWatch(participant.presenceId, (pose) => void movePawn(stage, pose)),
+        walkers: new WalkerMarkers(host, host.palette.text),
         cutouts: new CutoutCache(),
         sendCursors: throttle(1000 / CURSOR_HZ, (users: readonly CollaborationUserPresence[]) =>
             stage.relay.sendCursors(cursorsOf(users)),
         ),
+        viewHtml: buildViewHtml({
+            backendUrl: BACKEND_URL,
+            stageId: frame.meta.stageId,
+            token: frame.meta.token,
+            participant,
+        }),
         viewWanted: true,
         viewOpen: false,
         dropped: { cutouts: 0, items: 0, tooBig: 0 },
     };
+    // presence-changed does not fire on subscribe, so the user list read above seeds the cursors.
+    if (users.ok) stage.relay.sendCursors(cursorsOf(users.value.users));
     return stage;
 }
 
@@ -208,17 +224,25 @@ function onScene(event: SceneEvent): void {
 }
 
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
+let flushDue = 0;
 let flushing = false;
-let flushAgain = false;
+/** When a flush asked for while one runs should start; null when none was asked for. */
+let flushAgainAt: number | null = null;
 let lastFlush = 0;
 
+/** Flushes after `delay`, or sooner when an earlier flush is already due. */
 function scheduleFlush(delay = 0): void {
+    const due = Math.max(Date.now() + delay, lastFlush + FLUSH_MS);
     if (flushing) {
-        flushAgain = true;
+        flushAgainAt = Math.min(flushAgainAt ?? due, due);
         return;
     }
-    if (flushTimer) return;
-    flushTimer = setTimeout(runFlush, Math.max(delay, lastFlush + FLUSH_MS - Date.now(), 0));
+    if (flushTimer) {
+        if (flushDue <= due) return;
+        clearTimeout(flushTimer);
+    }
+    flushDue = due;
+    flushTimer = setTimeout(runFlush, due - Date.now());
 }
 
 async function runFlush(): Promise<void> {
@@ -231,12 +255,23 @@ async function runFlush(): Promise<void> {
         console.error("[paper-stage] sync failed", err);
     } finally {
         flushing = false;
-        if (flushAgain) {
-            flushAgain = false;
-            scheduleFlush();
+        if (flushAgainAt !== null) {
+            const at = flushAgainAt;
+            flushAgainAt = null;
+            scheduleFlush(at - Date.now());
         }
     }
 }
+
+const boardBoxes = (scene: SceneState): Rect[] =>
+    [...scene.elements.values()].flatMap((element) => {
+        const rect = rectOf(element);
+        return rect ? [turnedBox(rect, element.rotation ?? 0)] : [];
+    });
+
+/** What a capture of a cutout depends on: where it sits, how it looks, and the box Drawdy exports around it. */
+const captureKey = (item: BoardItem | null, board: readonly Rect[]): string | null =>
+    item?.kind === "cutout" ? JSON.stringify([item.rect, item.contentHash, exportBounds(item.rect, board)]) : null;
 
 async function flush(stage: Stage): Promise<void> {
     const projection = projectStage(stage.scene);
@@ -247,11 +282,9 @@ async function flush(stage: Stage): Promise<void> {
 
     const items = new Map<ElementId, StageItem>();
     const assets = new Map<AssetHash, CutoutAsset>();
-    const board = [...stage.scene.elements.values()].flatMap((element) => {
-        const rect = rectOf(element);
-        return rect ? [turnedBox(rect, element.rotation ?? 0)] : [];
-    });
+    const board = boardBoxes(stage.scene);
     let tooBig = 0;
+    let retryInMs = Infinity;
     for (const item of projection.items) {
         if (item.kind !== "cutout") {
             items.set(item.id, item);
@@ -259,10 +292,22 @@ async function flush(stage: Stage): Promise<void> {
         }
         let result = stage.cutouts.get(item.id, item.contentHash);
         if (!result) {
-            result = await captureCutout(host, item.rect, board);
+            const key = captureKey(item, board);
+            const captured = await captureCutout(host, item.rect, board);
             // A capture that finishes after the writer changed belongs to an older epoch.
             if (stage.relay.writerEpoch !== epoch) return;
-            stage.cutouts.set(item.id, item.contentHash, result);
+            // Drawdy exports the board as it is when it runs the command. If the cutout or what gets exported with it
+            // changed since this flush began, the pixels may match neither, so they are dropped and captured again.
+            if (captureKey(stageItemOf(stage.scene, item.id), boardBoxes(stage.scene)) !== key) {
+                scheduleFlush();
+                continue;
+            }
+            stage.cutouts.set(item.id, item.contentHash, captured);
+            result = stage.cutouts.get(item.id, item.contentHash)!;
+        }
+        if ("retryInMs" in result) {
+            retryInMs = Math.min(retryInMs, result.retryInMs);
+            continue;
         }
         if (!result.ok) {
             if (result.reason === "too_big") tooBig++;
@@ -274,6 +319,7 @@ async function flush(stage: Stage): Promise<void> {
     stage.cutouts.retain(new Set(projection.items.map((item) => item.id)));
     noteDropped(stage, { ...projection.dropped, tooBig });
     stage.relay.commit(epoch, { frame: projection.frame, items, assets });
+    if (retryInMs < Infinity) scheduleFlush(retryInMs);
 }
 
 function noteDropped(stage: Stage, dropped: Partial<Stage["dropped"]>): void {
@@ -296,25 +342,10 @@ function closeStage(stage: Stage): void {
     if (state.phase !== "running" || state.stage !== stage) return;
     state = { phase: "idle" };
     stage.relay.stop();
-    stage.rest.stop();
+    void stage.walkers.stop();
     stage.viewWanted = false;
     syncView(stage);
     void host.hint("The Paper Stage frame is gone", ["Click the Paper Stage button to build a new stage."]);
-}
-
-async function movePawn(stage: Stage, pose: Pose): Promise<void> {
-    const pawn = projectStage(stage.scene)?.items.find((item) => item.kind === "pawn");
-    const element = pawn && stage.scene.elements.get(pawn.id);
-    const rect = element && rectOf(element);
-    if (!pawn || pawn.kind !== "pawn" || !rect || Math.hypot(pawn.x - pose.x, pawn.y - pose.y) < 1) return;
-    await host.run("command:scene:update-drawdy-elements", {
-        updates: [
-            {
-                drawdyElementId: pawn.id,
-                properties: { transform: { x: pose.x - rect.width / 2, y: pose.y - rect.height / 2 } },
-            },
-        ],
-    });
 }
 
 function setViewWanted(stage: Stage, wanted: boolean): void {
@@ -326,11 +357,25 @@ function setViewWanted(stage: Stage, wanted: boolean): void {
 
 let viewQueue = Promise.resolve();
 
+function queueView(task: () => Promise<void>): void {
+    viewQueue = viewQueue.then(task).catch((err: unknown) => console.error("[paper-stage] view failed", err));
+}
+
 /** Opens or closes the 3D view to match intent: open only when wanted and after the relay's first welcome. */
 function syncView(stage: Stage): void {
-    viewQueue = viewQueue
-        .then(() => applyView(stage))
-        .catch((err: unknown) => console.error("[paper-stage] view failed", err));
+    queueView(() => applyView(stage));
+}
+
+let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+
+function onResize(stage: Stage, window: { width: number; height: number }): void {
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+        resizeTimer = null;
+        queueView(async () => {
+            if (stage.viewOpen) await placeView(stage, window);
+        });
+    }, RESIZE_SETTLE_MS);
 }
 
 async function applyView(stage: Stage): Promise<void> {
@@ -342,7 +387,8 @@ async function applyView(stage: Stage): Promise<void> {
         stage.viewOpen = false;
         return;
     }
-    stage.viewOpen = await openView(stage);
+    const size = await host.run("command:dom:window-size");
+    stage.viewOpen = size.ok && (await placeView(stage, size.value));
     if (!stage.viewOpen) {
         stage.viewWanted = false;
         return;
@@ -351,21 +397,14 @@ async function applyView(stage: Stage): Promise<void> {
     await subscribe("subscription:dom:screen-resized");
 }
 
-async function openView(stage: Stage): Promise<boolean> {
-    const size = await host.run("command:dom:window-size");
-    if (!size.ok) return false;
-    const layout = viewLayout(size.value);
-    const boot = {
-        backendUrl: BACKEND_URL,
-        stageId: stage.meta.stageId,
-        token: stage.meta.token,
-        participant: stage.participant,
-    };
-    const opened = await host.run("command:dom:upsert-floating-element", {
+/** Shows the view sized to the window. The srcDoc is the same string every time; only size and position change. */
+async function placeView(stage: Stage, window: { width: number; height: number }): Promise<boolean> {
+    const layout = viewLayout(window);
+    const placed = await host.run("command:dom:upsert-floating-element", {
         domId: VIEW_ID,
         position: layout.position,
         asPopover: false,
-        schema: viewSchema(buildViewHtml(boot), layout, host.palette),
+        schema: viewSchema(stage.viewHtml, layout, host.palette),
     });
-    return opened.ok;
+    return placed.ok;
 }

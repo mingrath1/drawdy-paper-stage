@@ -40,8 +40,9 @@ export const ROLE_META_KEY = "paperStageRole";
 
 const ROLE_BY_META = new Map<unknown, StageRole>([["pawn", "pawn"]]);
 
-// Drawdy reads every shape, line and arrow back as "path". Triangles, stars, lines and arrows carry no componentType,
-// and Drawdy turns pencil strokes into such shapes, so a bare "path" stands up as a drawing.
+// Drawdy reads every shape, line and arrow back as "path". Only the four shapes the protocol can create carry a
+// componentType; a bare path is a line, an arrow, or a shape Drawdy made from a pencil stroke (a triangle, a star),
+// and all of those stand up as cutouts.
 const ROLE_BY_KIND = new Map<string, StageRole>([
     ["path/rect", "wall"],
     ["path/circle", "wall"],
@@ -69,7 +70,7 @@ export function rectOf(element: BoardElement): Rect | null {
 }
 
 export function belongsToStage(element: BoardElement, frameId: ElementId, frame: Rect): boolean {
-    if (element.frameId === frameId) return true;
+    if (element.frameId) return element.frameId === frameId;
     const rect = rectOf(element);
     if (!rect) return false;
     const cx = rect.x + rect.width / 2;
@@ -180,6 +181,21 @@ function toBoardItem(element: BoardElement, role: StageRole, rect: Rect): BoardI
     }
 }
 
+function memberItem(element: BoardElement, frameId: ElementId, frame: Rect): BoardItem | null {
+    const role = classify(element);
+    const rect = rectOf(element);
+    if (!role || !rect || !belongsToStage(element, frameId, frame)) return null;
+    return toBoardItem(element, role, rect);
+}
+
+/** The stage item one element stands as right now, or null when it stands as none. Ignores the caps. */
+export function stageItemOf(state: SceneState, id: ElementId): BoardItem | null {
+    const frameElement = state.elements.get(state.frameId);
+    const frame = frameElement && rectOf(frameElement);
+    const element = state.elements.get(id);
+    return frame && element ? memberItem(element, state.frameId, frame) : null;
+}
+
 /** What stands on the stage right now, or null when the stage frame is gone. */
 export function projectStage(state: SceneState): StageProjection | null {
     const frameElement = state.elements.get(state.frameId);
@@ -190,10 +206,8 @@ export function projectStage(state: SceneState): StageProjection | null {
     const walls: BoardItem[] = [];
     const cutouts: BoardItem[] = [];
     for (const element of state.elements.values()) {
-        const role = classify(element);
-        const rect = rectOf(element);
-        if (!role || !rect || !belongsToStage(element, state.frameId, frame)) continue;
-        const item = toBoardItem(element, role, rect);
+        const item = memberItem(element, state.frameId, frame);
+        if (!item) continue;
         if (item.kind === "pawn") pawn ??= item;
         else (item.kind === "wall" ? walls : cutouts).push(item);
     }
