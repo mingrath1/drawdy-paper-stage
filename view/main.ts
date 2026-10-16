@@ -121,8 +121,8 @@ function fitCanvas(): void {
     camera.updateProjectionMatrix();
 }
 
-/** Read by verification scripts: the last whole second's frame rate and what was on stage. */
-const stats = { fps: 0, walls: 0, cutouts: 0, drawCalls: 0 };
+/** Read by verification scripts: the last whole second's frame rate, what was on stage, and where the walker stood. */
+const stats = { fps: 0, walls: 0, cutouts: 0, drawCalls: 0, textures: 0, walker: { x: 0, z: 0 } };
 Object.assign(globalThis, { paperStage: stats });
 
 let frames = 0;
@@ -156,6 +156,8 @@ renderer.setAnimationLoop(() => {
         stats.walls = stage.walls;
         stats.cutouts = stage.cutouts;
         stats.drawCalls = renderer.info.render.calls;
+        stats.textures = renderer.info.memory.textures;
+        stats.walker = walk.position;
         frames = 0;
         windowStart = now;
         hud.frameRate(stats.fps);

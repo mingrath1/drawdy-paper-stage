@@ -1,6 +1,8 @@
 // A local stand-in for the Stage object, speaking the part of protocol v2 the 3D view uses.
 // Stages: "demo" is a two-room plan with three cutouts, a walker circling, and a hand dragging the cart.
 // "perf" is 40 walls and 30 cutouts with the same walker and hand. "uninit" closes with 4409, any other token 4401.
+// GET /api/stages/<id>/dev/<action> changes a live stage: "reset" resizes the frame from the left, drops the tree, and
+// stands a wall on the first viewer; "redraw" gives the star a new picture; "writer" elects a new writer.
 // Usage: node view/dev/fake-stage.mjs [--port 8787]
 
 import { createServer } from "node:http";
@@ -131,6 +133,7 @@ class FakeStage {
         this.drag = built.drag;
         this.orbit = built.walkerOrbit;
         this.revision = 1;
+        this.epoch = 1;
         this.views = new Map();
         this.started = Date.now();
     }
@@ -162,6 +165,30 @@ class FakeStage {
             participant: MALI,
             pose: { x: x + r * Math.sin(t), y: y + r * Math.cos(t), heading: normalize(t + Math.PI / 2), pitch: 0 },
         };
+    }
+
+    patch(change) {
+        this.broadcast({ type: "scene.patch", revision: ++this.revision, removes: [], ...change });
+    }
+
+    act(action) {
+        if (action === "reset") {
+            const viewer = [...this.views.values()].find((view) => view.walker)?.walker.pose;
+            this.frame = { ...this.frame, x: this.frame.x + 100, width: this.frame.width - 100 };
+            this.items.delete("tree");
+            if (viewer) this.items.set("dropped", wallV("dropped", viewer.x, viewer.y - 150, viewer.y + 150));
+            this.patch({ reset: true, frame: this.frame, upserts: [...this.items.values()] });
+        } else if (action === "redraw") {
+            const star = this.items.get("star");
+            const picture = doodle("star", (this.revision * 67) % 360);
+            this.assets.set(picture.hash, picture.png);
+            const asset = { hash: picture.hash, width: picture.width, height: picture.height };
+            this.items.set("star", { ...star, asset });
+            this.patch({ upserts: [this.items.get("star")] });
+        } else if (action === "writer") {
+            this.broadcast({ type: "writer", writer: { connectionId: "fake-writer", epoch: ++this.epoch } });
+        } else return false;
+        return true;
     }
 
     /** One 16 second loop: reach in, drag the cutout one way, leave the frame; then the same back. */
@@ -217,8 +244,13 @@ export function startFakeStage({ port = 8787 } = {}) {
 
     const server = createServer((request, response) => {
         const url = new URL(request.url, "http://localhost");
-        const match = /^\/api\/stages\/([^/]+)\/assets\/([0-9a-f]{64})$/.exec(url.pathname);
         const headers = { "access-control-allow-origin": "*" };
+        const dev = /^\/api\/stages\/([^/]+)\/dev\/([a-z]+)$/.exec(url.pathname);
+        if (dev) {
+            const done = stageFor(decodeURIComponent(dev[1]))?.act(dev[2]);
+            return response.writeHead(done ? 200 : 404, headers).end(done ? "ok" : "no such stage or action");
+        }
+        const match = /^\/api\/stages\/([^/]+)\/assets\/([0-9a-f]{64})$/.exec(url.pathname);
         if (!match) return response.writeHead(404, headers).end();
         if (url.searchParams.get("token") !== DEV_TOKEN) return response.writeHead(401, headers).end();
         const png = stageFor(decodeURIComponent(match[1]))?.assets.get(match[2]);
