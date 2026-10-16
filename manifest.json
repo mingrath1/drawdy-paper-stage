@@ -7,7 +7,6 @@
     "permissions": [
         "dom",
         "scene",
-        "collaboration",
-        "storage"
+        "collaboration"
     ]
 }
