@@ -321,23 +321,23 @@ async function flush(stage: Stage): Promise<void> {
             if (stage.relay.writerEpoch !== epoch) return;
             // Drawdy exports the board as it is when it runs the command. If the cutout or what gets exported with it
             // changed since this flush began, the pixels may match neither, so they are dropped and captured again.
-            if (captureKey(stage.scene, stageItemOf(stage.scene, item.id)) !== key) {
+            if (captureKey(stage.scene, stageItemOf(stage.scene, item.id)) === key) {
+                stage.cutouts.set(item.id, picture, captured);
+                result = stage.cutouts.get(item.id, picture);
+            } else {
                 scheduleFlush();
-                continue;
             }
-            stage.cutouts.set(item.id, picture, captured);
-            result = stage.cutouts.get(item.id, picture)!;
         }
-        if ("retryInMs" in result) {
-            retryInMs = Math.min(retryInMs, result.retryInMs);
+        if (result && "retryInMs" in result) retryInMs = Math.min(retryInMs, result.retryInMs);
+        if (result && "ok" in result && !result.ok && result.reason === "too_big") {
+            tooBig++;
             continue;
         }
-        if (!result.ok) {
-            if (result.reason === "too_big") tooBig++;
-            continue;
-        }
-        items.set(item.id, { kind: "cutout", id: item.id, rect: item.rect, asset: result.cutout.asset });
-        assets.set(result.cutout.asset.hash, result.cutout);
+        // Until a fresh picture lands, the cutout keeps its last one where it now stands, so it never blinks out.
+        const cutout = result && "ok" in result && result.ok ? result.cutout : stage.cutouts.latest(item.id);
+        if (!cutout) continue;
+        items.set(item.id, { kind: "cutout", id: item.id, rect: item.rect, asset: cutout.asset });
+        assets.set(cutout.asset.hash, cutout);
     }
     stage.cutouts.retain(new Set(projection.items.map((item) => item.id)));
     noteDropped(stage, { ...projection.dropped, tooBig });

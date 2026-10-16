@@ -209,11 +209,13 @@ const RETRY_MS = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
 type CacheEntry = { hash: string } & ({ result: CaptureResult } | { failures: number; retryAt: number });
 
 /**
- * Captures keyed by element and content hash. A too-big capture is kept, since it comes out the same until the
- * drawing changes. A failed one may be a passing hiccup, so it is retried with a growing, bounded backoff.
+ * Captures keyed by element and picture key. A too-big capture is kept, since it comes out the same until the
+ * picture changes. A failed one may be a passing hiccup, so it is retried with a growing, bounded backoff.
  */
 export class CutoutCache {
     private readonly entries = new Map<ElementId, CacheEntry>();
+    /** The newest good capture of each element, whatever its key. */
+    private readonly good = new Map<ElementId, CutoutAsset>();
 
     constructor(private readonly now: () => number = Date.now) {}
 
@@ -226,7 +228,14 @@ export class CutoutCache {
         return wait > 0 ? { retryInMs: wait } : undefined;
     }
 
+    /** The newest good capture of the element, which stands in while a fresh one is pending. */
+    latest(id: ElementId): CutoutAsset | undefined {
+        return this.good.get(id);
+    }
+
     set(id: ElementId, hash: string, result: CaptureResult): void {
+        if (result.ok) this.good.set(id, result.cutout);
+        else if (result.reason === "too_big") this.good.delete(id);
         if (result.ok || result.reason === "too_big") {
             this.entries.set(id, { hash, result });
             return;
@@ -239,5 +248,6 @@ export class CutoutCache {
 
     retain(ids: ReadonlySet<ElementId>): void {
         for (const id of this.entries.keys()) if (!ids.has(id)) this.entries.delete(id);
+        for (const id of this.good.keys()) if (!ids.has(id)) this.good.delete(id);
     }
 }

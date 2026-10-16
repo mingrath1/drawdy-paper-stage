@@ -277,6 +277,27 @@ describe("the driver against a fake Drawdy", () => {
         expect(capturesOfD).toHaveLength(2);
     });
 
+    it("keeps a cutout on the stage with its last picture while a new one is pending or fails", async () => {
+        const fake = new FakeDrawdy([frame, doodle("d", 100, 100), doodle("n", 300, 300)]);
+        const { socket, moveElement } = await startDriver(fake);
+        await vi.advanceTimersByTimeAsync(500);
+        const before = writes(socket).length;
+        let step = 0;
+        fake.duringCapture = () => {
+            if (++step <= 3) moveElement(doodle("n", 125 + step, 110));
+        };
+        moveElement(doodle("n", 125, 110));
+        await vi.advanceTimersByTimeAsync(1_000);
+        fake.failCaptures = 1;
+        moveElement(doodle("n", 300, 300));
+        await vi.advanceTimersByTimeAsync(500);
+        const commits = writes(socket)
+            .slice(before)
+            .filter((m) => m.type === "scene.commit");
+        expect(commits.length).toBeGreaterThan(1);
+        expect(commits.flatMap((m) => m.removes)).toEqual([]);
+    });
+
     it("keeps a cutout's picture while it is dragged around inside a room", async () => {
         const room = { ...doodle("room", 50, 50), type: "path", componentType: "rect", width: 400, height: 300 };
         const fake = new FakeDrawdy([frame, room as SubscribedDrawdyElement, doodle("d", 100, 100)]);
