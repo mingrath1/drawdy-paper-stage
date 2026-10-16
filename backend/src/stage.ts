@@ -31,10 +31,15 @@ import {
 import {
   applyPatch,
   checkpointEvery32,
+  type CommitReceipt,
+  commitPayload,
   CommitReceipts,
+  findReceipt,
   planCommit,
+  type ReceiptsState,
   referencedAssets,
   type Refusal,
+  remember,
   SceneDoc,
   type SceneState,
   sceneSnapshot,
@@ -153,9 +158,10 @@ const byJoinOrder = (left: Connection, right: Connection): number =>
 
 export class Stage extends DurableObject<Env> {
   #harness!: Harness;
-  /** In-memory copies of the two documents. Only `#stageOperations` changes them, right after each commit. */
+  /** In-memory copies of the documents. Only `#stageOperations` changes them, right after each commit. */
   #scene!: SceneState;
   #control!: ControlState;
+  #receipts!: ReceiptsState;
   readonly #connections = new WeakMap<WebSocket, Connection>();
   readonly #budgets = new WeakMap<WebSocket, Budget>();
   readonly #departed = new WeakSet<WebSocket>();
@@ -196,6 +202,10 @@ export class Stage extends DurableObject<Env> {
       );
       this.#control = structuredClone(
         (await harness.snapshot(ControlDoc, BACKGROUND_CONTEXT)) ?? ControlDoc.definition.initial(),
+      );
+      this.#receipts = structuredClone(
+        (await harness.snapshot(CommitReceipts, BACKGROUND_CONTEXT)) ??
+          CommitReceipts.definition.initial(),
       );
       // A deploy drops every socket, so the stored writer may be gone.
       await this.#electWriter();
@@ -419,24 +429,45 @@ export class Stage extends DurableObject<Env> {
     connection: Joined,
     commit: Extract<ClientMessage, { type: "scene.commit" }>,
   ): Promise<void> {
-    const { requestId } = commit;
-    const receipt = await this.#harness.snapshot(CommitReceipts, requestId, BACKGROUND_CONTEXT);
-    if (receipt?.revision !== undefined) {
-      return this.#send(socket, { type: "ack", requestId, ok: true, revision: receipt.revision });
+    const { requestId, epoch } = commit;
+    const writerRefusal = this.#writerRefusal(connection, epoch);
+    if (writerRefusal !== undefined) {
+      return this.#send(socket, { type: "ack", requestId, ...writerRefusal });
     }
-    const plan =
-      this.#writerRefusal(connection, commit.epoch) ??
-      planCommit(this.#scene, this.#control.assets, commit);
+    const digest = await sha256Hex(commitPayload(commit));
+    const receipt = findReceipt(this.#receipts, epoch, requestId);
+    if (receipt !== undefined) {
+      return this.#send(
+        socket,
+        receipt.digest === digest
+          ? { type: "ack", requestId, ok: true, revision: receipt.revision }
+          : {
+              type: "ack",
+              requestId,
+              ok: false,
+              error: "bad_message",
+              message: "this requestId already named a different commit",
+            },
+      );
+    }
+    const plan = planCommit(this.#scene, this.#control.assets, commit);
     if (!plan.ok) return this.#send(socket, { type: "ack", requestId, ...plan });
 
     const { patch } = plan;
+    const accepted: CommitReceipt = {
+      epoch,
+      requestId,
+      digest,
+      revision: patch?.revision ?? this.#scene.revision,
+    };
     await this.#harness.commit(async (tx) => {
-      applyPatch(await tx.doc(SceneDoc), patch);
-      (await tx.doc(CommitReceipts, requestId, null)).revision = patch.revision;
+      if (patch !== undefined) applyPatch(await tx.doc(SceneDoc), patch);
+      remember(await tx.doc(CommitReceipts), accepted);
     }, BACKGROUND_CONTEXT);
-    applyPatch(this.#scene, patch);
-    this.#send(socket, { type: "ack", requestId, ok: true, revision: patch.revision });
-    this.#broadcast({ type: "scene.patch", ...patch }, () => true, socket);
+    if (patch !== undefined) applyPatch(this.#scene, patch);
+    remember(this.#receipts, accepted);
+    this.#send(socket, { type: "ack", requestId, ok: true, revision: accepted.revision });
+    if (patch !== undefined) this.#broadcast({ type: "scene.patch", ...patch }, () => true, socket);
   }
 
   async #putAsset(

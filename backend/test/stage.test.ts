@@ -383,6 +383,65 @@ describe("scene", () => {
   });
 });
 
+describe("commit receipts", () => {
+  it("fences a reused requestId by writer and epoch before answering from a receipt", async () => {
+    const stageId = freshStage();
+    const first = await writerOf(stageId);
+    first.client.send(commit(first.epoch, "r1", { upserts: [wall("a")] }));
+    expect(await first.client.expect("ack")).toMatchObject({ ok: true, revision: 1 });
+    first.client.send(commit(first.epoch - 1, "r1", { upserts: [wall("a")] }));
+    expect(await first.client.expect("ack")).toMatchObject({ ok: false, error: "stale_epoch" });
+
+    const second = await join(stageId, "driver", "second");
+    second.client.send(commit(first.epoch, "r1", { upserts: [wall("a")] }));
+    expect(await second.client.expect("ack")).toMatchObject({ ok: false, error: "not_writer" });
+
+    first.client.close();
+    const { writer } = await second.client.expect("writer");
+    second.client.send(commit(writer.epoch, "r1", { upserts: [wall("b")] }));
+    expect(await second.client.expect("ack")).toMatchObject({ ok: true, revision: 2 });
+    const { welcome } = await join(stageId, "view");
+    expect(welcome.snapshot.items).toEqual([wall("a"), wall("b")]);
+  });
+
+  it("refuses a requestId reused for a different commit and applies nothing", async () => {
+    const stageId = freshStage();
+    const { client: writer, epoch } = await writerOf(stageId);
+    const { client: view } = await join(stageId, "view");
+    writer.send(commit(epoch, "r1", { upserts: [wall("a")] }));
+    expect(await writer.expect("ack")).toMatchObject({ ok: true, revision: 1 });
+    await view.expect("scene.patch");
+
+    writer.send(commit(epoch, "r1", { upserts: [wall("b")] }));
+    expect(await writer.expect("ack")).toMatchObject({ ok: false, error: "bad_message" });
+    await view.expectQuiet();
+    const { welcome } = await join(stageId, "view");
+    expect(welcome.snapshot).toMatchObject({ revision: 1, items: [wall("a")] });
+  });
+
+  it("acks a commit that changes nothing with the current revision and broadcasts no patch", async () => {
+    const stageId = freshStage();
+    const { client: writer, epoch } = await writerOf(stageId);
+    const { client: view } = await join(stageId, "view");
+    const frame = { x: 0, y: 0, width: 400, height: 300 };
+    writer.send(commit(epoch, "r1", { frame, upserts: [wall("a"), wall("b")] }));
+    expect(await writer.expect("ack")).toMatchObject({ ok: true, revision: 1 });
+    await view.expect("scene.patch");
+
+    writer.send(commit(epoch, "same", { frame, upserts: [wall("a")], removes: ["gone"] }));
+    expect(await writer.expect("ack")).toMatchObject({ ok: true, revision: 1 });
+    writer.send(commit(epoch, "same-reset", { reset: true, upserts: [wall("b"), wall("a")] }));
+    expect(await writer.expect("ack")).toMatchObject({ ok: true, revision: 1 });
+    writer.send(commit(epoch, "empty", {}));
+    expect(await writer.expect("ack")).toMatchObject({ ok: true, revision: 1 });
+    await view.expectQuiet();
+
+    writer.send(commit(epoch, "shrink", { reset: true, upserts: [wall("a")] }));
+    expect(await writer.expect("ack")).toMatchObject({ ok: true, revision: 2 });
+    expect(await view.expect("scene.patch")).toMatchObject({ revision: 2, reset: true });
+  });
+});
+
 describe("writer election", () => {
   it("fences commits to the elected writer and its epoch, and promotes the next driver on close", async () => {
     const stageId = freshStage();

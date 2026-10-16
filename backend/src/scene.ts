@@ -1,4 +1,4 @@
-import { type CheckpointInfo, defineDoc, defineDocFamily } from "@earendil-works/pi-durable";
+import { type CheckpointInfo, defineDoc } from "@earendil-works/pi-durable";
 import {
   type AssetHash,
   type ClientMessage,
@@ -32,14 +32,39 @@ export const SceneDoc = defineDoc<SceneState>({
   checkpointWhen: checkpointEvery32,
 });
 
-/** The revision each applied commit produced, keyed by its requestId, so a retried commit is acked, not reapplied. */
-export const CommitReceipts = defineDocFamily<{ revision?: number }, null>({
-  family: true,
-  kind: "app.stage-commit-receipt",
+/** An accepted commit, so a resend of the same commit is acked again instead of applied twice. */
+export type CommitReceipt = { epoch: number; requestId: string; digest: string; revision: number };
+export type ReceiptsState = { receipts: CommitReceipt[] };
+
+/** A driver resends unanswered messages after 5 s, far fewer than this many. */
+export const MAX_RECEIPTS = 256;
+
+export const CommitReceipts = defineDoc<ReceiptsState>({
+  kind: "app.stage-commit-receipts",
   version: 1,
   scope: "session",
-  initial: () => ({}),
+  initial: () => ({ receipts: [] }),
+  checkpointWhen: checkpointEvery32,
 });
+
+export const findReceipt = (
+  state: Readonly<ReceiptsState>,
+  epoch: number,
+  requestId: string,
+): CommitReceipt | undefined =>
+  state.receipts.find((receipt) => receipt.epoch === epoch && receipt.requestId === requestId);
+
+/** Keeps the newest MAX_RECEIPTS receipts. The Stage runs it on the document draft and then on its in-memory copy. */
+export function remember(state: ReceiptsState, receipt: CommitReceipt): void {
+  state.receipts.push(receipt);
+  if (state.receipts.length > MAX_RECEIPTS) {
+    state.receipts.splice(0, state.receipts.length - MAX_RECEIPTS);
+  }
+}
+
+/** The part of a commit a resend must repeat exactly. The parser builds every item with a fixed key order. */
+export const commitPayload = ({ reset, frame, upserts, removes }: SceneCommit): string =>
+  JSON.stringify([reset ?? false, frame ?? null, upserts, removes]);
 
 export type SceneCommit = Extract<ClientMessage, { type: "scene.commit" }>;
 export type ScenePatch = Omit<Extract<ServerMessage, { type: "scene.patch" }>, "type">;
@@ -69,14 +94,15 @@ export const referencedAssets = (scene: Readonly<SceneState>): Set<AssetHash> =>
   );
 
 /**
- * Checks a writer's commit against the stage limits and the uploaded assets, and returns the patch that applies it.
+ * Checks a writer's commit against the stage limits and the uploaded assets, and returns the patch that applies it,
+ * or no patch when the commit would leave the scene as it is.
  * `meshUrl` is server-owned: an upserted cutout keeps the one already stored under its id and drops any it sent.
  */
 export function planCommit(
   scene: Readonly<SceneState>,
   assets: Readonly<Record<AssetHash, { width: number; height: number }>>,
   commit: SceneCommit,
-): { ok: true; patch: ScenePatch } | Refusal {
+): { ok: true; patch: ScenePatch | undefined } | Refusal {
   const touched = new Set([...commit.upserts.map((item) => item.id), ...commit.removes]);
   if ([...touched].some((id) => RESERVED_IDS.has(id))) {
     return refuse("bad_message", "element ids cannot be __proto__, constructor, or prototype");
@@ -106,21 +132,29 @@ export function planCommit(
     return refuse("limit", `a stage holds at most ${MAX_CUTOUTS_PER_STAGE} cutouts`);
   }
 
-  return {
-    ok: true,
-    patch: {
-      revision: scene.revision + 1,
-      ...(commit.reset ? { reset: true } : {}),
-      ...(commit.frame === undefined ? {} : { frame: commit.frame }),
-      upserts: commit.upserts.map((item) =>
-        withStoredMesh(
-          item,
-          Object.hasOwn(scene.items, item.id) ? scene.items[item.id] : undefined,
-        ),
-      ),
-      removes: commit.removes,
-    },
+  const patch: ScenePatch = {
+    revision: scene.revision + 1,
+    ...(commit.reset ? { reset: true } : {}),
+    ...(commit.frame === undefined ? {} : { frame: commit.frame }),
+    upserts: commit.upserts.map((item) =>
+      withStoredMesh(item, Object.hasOwn(scene.items, item.id) ? scene.items[item.id] : undefined),
+    ),
+    removes: commit.removes,
   };
+  return { ok: true, patch: changesScene(scene, patch) ? patch : undefined };
+}
+
+const sameJson = (left: unknown, right: unknown): boolean =>
+  JSON.stringify(left) === JSON.stringify(right);
+
+function changesScene(scene: Readonly<SceneState>, patch: ScenePatch): boolean {
+  const stored = (id: ElementId) => (Object.hasOwn(scene.items, id) ? scene.items[id] : undefined);
+  if (patch.frame !== undefined && !sameJson(patch.frame, scene.frame)) return true;
+  if (patch.removes.some((id) => stored(id) !== undefined)) return true;
+  if (patch.upserts.some((item) => !sameJson(item, stored(item.id)))) return true;
+  if (!patch.reset) return false;
+  const upserted = new Set(patch.upserts.map((item) => item.id));
+  return Object.keys(scene.items).some((id) => !upserted.has(id));
 }
 
 function withStoredMesh(item: StageItem, stored: StageItem | undefined): StageItem {

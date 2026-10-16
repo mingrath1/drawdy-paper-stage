@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { StageItem } from "../../shared/protocol.ts";
-import { applyPatch, planCommit, type SceneCommit, type SceneState } from "../src/scene.ts";
+import {
+  applyPatch,
+  type CommitReceipt,
+  findReceipt,
+  MAX_RECEIPTS,
+  planCommit,
+  remember,
+  type SceneCommit,
+  type SceneState,
+} from "../src/scene.ts";
 
 const asset = { hash: "a".repeat(64), width: 10, height: 10 };
 const assets = { [asset.hash]: { width: 10, height: 10 } };
@@ -30,7 +39,7 @@ const commit = (fields: Partial<SceneCommit>): SceneCommit => ({
 function applied(scene: SceneState, change: SceneCommit): SceneState {
   const plan = planCommit(scene, assets, change);
   if (!plan.ok) throw new Error(plan.message);
-  applyPatch(scene, plan.patch);
+  if (plan.patch !== undefined) applyPatch(scene, plan.patch);
   return scene;
 }
 
@@ -78,4 +87,17 @@ it("refuses element ids that reach the prototype chain", () => {
     ok: false,
     error: "bad_message",
   });
+});
+
+it("keeps only the newest MAX_RECEIPTS commit receipts", () => {
+  const state = { receipts: [] as CommitReceipt[] };
+  const total = MAX_RECEIPTS + 10;
+  for (let index = 0; index < total; index++) {
+    remember(state, { epoch: 1, requestId: `r${index}`, digest: "d", revision: index });
+  }
+  expect(state.receipts).toHaveLength(MAX_RECEIPTS);
+  expect(findReceipt(state, 1, "r9")).toBeUndefined();
+  expect(findReceipt(state, 1, "r10")).toMatchObject({ revision: 10 });
+  expect(findReceipt(state, 1, `r${total - 1}`)).toMatchObject({ revision: total - 1 });
+  expect(findReceipt(state, 2, `r${total - 1}`)).toBeUndefined();
 });
