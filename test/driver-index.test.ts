@@ -131,6 +131,8 @@ class FakeDrawdy {
                 return { value: { users: this.users } };
             case "command:dom:window-size":
                 return { value: this.window };
+            case "command:scene:create-drawdy-preview-elements":
+                return { value: { previewed: request.req.elements.length, previewId: `pv${this.requests.length}` } };
             case "command:scene:capture-screenshot": {
                 this.duringCapture();
                 if (this.failCaptures > 0) {
@@ -271,6 +273,34 @@ describe("the driver against a fake Drawdy", () => {
         expect(socket.sent.filter((m) => m.type === "cursors")).toEqual([
             { type: "cursors", epoch: 1, cursors: [{ presenceId: "friend", name: "Ploy", color: "#0ca678", x: 5, y: 6 }] },
         ]);
+    });
+
+    it("shows walkers on the board as local previews and never moves the shared pawn", async () => {
+        const pawn = {
+            id: "pawn",
+            type: "path",
+            componentType: "circle",
+            x: 200,
+            y: 200,
+            width: 36,
+            height: 36,
+            frameId: FRAME_ID,
+            meta: { paperStageRole: "pawn" },
+        } as SubscribedDrawdyElement;
+        const fake = new FakeDrawdy([frame, pawn]);
+        const { socket } = await startDriver(fake);
+        const me = { presenceId: "me", name: "Ming", color: "#7c3aed" };
+        for (let x = 300; x <= 400; x += 20) {
+            socket.receive({ type: "walker", walker: { connectionId: "v1", participant: me, pose: { x, y: 250, heading: 0, pitch: 0 } } });
+            await vi.advanceTimersByTimeAsync(50);
+        }
+        await vi.advanceTimersByTimeAsync(3_000);
+        expect(fake.sent("command:scene:update-drawdy-elements")).toEqual([]);
+        const [created] = fake.sent("command:scene:create-drawdy-preview-elements");
+        expect(created.req.elements).toContainEqual(expect.objectContaining({ type: "text", text: "Ming" }));
+        socket.receive({ type: "walker.left", connectionId: "v1" });
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(fake.sent("command:scene:delete-drawdy-preview-elements")).toHaveLength(1);
     });
 
     it("refits the open view to a resized window once resizing settles, keeping the same page", async () => {

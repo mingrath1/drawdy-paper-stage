@@ -6,14 +6,13 @@ import {
     type AssetHash,
     type ElementId,
     type Participant,
-    type Pose,
     type Rect,
     type StageItem,
 } from "../shared/protocol";
 import { BACKEND_URL } from "./config";
 import { captureCutout, CutoutCache, exportBounds, turnedBox, type CutoutAsset } from "./cutouts";
 import { Host, type CommandType, type RequestArgs } from "./host";
-import { cursorsOf, participantOf, RestWatch, throttle } from "./presence";
+import { cursorsOf, participantOf, throttle } from "./presence";
 import { Relay } from "./relay";
 import { findFreeSpot, findStageFrame, newStageMeta, STAGE_SIZE, starterStage, type StageMeta } from "./stage-frame";
 import {
@@ -28,6 +27,7 @@ import {
 } from "./stage-model";
 import { buildViewHtml } from "./view-html";
 import { CLOSE_ID, VIEW_ID, viewLayout, viewSchema } from "./view-window";
+import { WalkerMarkers } from "./walkers";
 
 const BUTTON_ID = "paper-stage-button";
 const ICON =
@@ -51,7 +51,7 @@ type Stage = {
     participant: Participant;
     scene: SceneState;
     relay: Relay;
-    rest: RestWatch;
+    walkers: WalkerMarkers;
     cutouts: CutoutCache;
     sendCursors: (users: readonly CollaborationUserPresence[]) => void;
     viewHtml: string;
@@ -164,8 +164,8 @@ async function openStage(): Promise<Stage | null> {
         relay: new Relay(BACKEND_URL, frame.meta.stageId, frame.meta.token, participant, {
             welcomed: () => syncView(stage),
             syncNeeded: () => scheduleFlush(),
-            walker: (walker) => stage.rest.walker(walker),
-            walkerLeft: (connectionId) => stage.rest.left(connectionId),
+            walker: (walker) => stage.walkers.show(walker),
+            walkerLeft: (connectionId) => stage.walkers.leave(connectionId),
             rejected: (error, message) => {
                 console.warn(`[paper-stage] commit rejected: ${error} ${message}`);
                 scheduleFlush(RETRY_MS);
@@ -180,7 +180,7 @@ async function openStage(): Promise<Stage | null> {
                         : ["This version of Paper Stage is out of date. Update the extension and try again."],
                 ),
         }),
-        rest: new RestWatch(participant.presenceId, (pose) => void movePawn(stage, pose)),
+        walkers: new WalkerMarkers(host, host.palette.text),
         cutouts: new CutoutCache(),
         sendCursors: throttle(1000 / CURSOR_HZ, (users: readonly CollaborationUserPresence[]) =>
             stage.relay.sendCursors(cursorsOf(users)),
@@ -342,25 +342,10 @@ function closeStage(stage: Stage): void {
     if (state.phase !== "running" || state.stage !== stage) return;
     state = { phase: "idle" };
     stage.relay.stop();
-    stage.rest.stop();
+    void stage.walkers.stop();
     stage.viewWanted = false;
     syncView(stage);
     void host.hint("The Paper Stage frame is gone", ["Click the Paper Stage button to build a new stage."]);
-}
-
-async function movePawn(stage: Stage, pose: Pose): Promise<void> {
-    const pawn = projectStage(stage.scene)?.items.find((item) => item.kind === "pawn");
-    const element = pawn && stage.scene.elements.get(pawn.id);
-    const rect = element && rectOf(element);
-    if (!pawn || pawn.kind !== "pawn" || !rect || Math.hypot(pawn.x - pose.x, pawn.y - pose.y) < 1) return;
-    await host.run("command:scene:update-drawdy-elements", {
-        updates: [
-            {
-                drawdyElementId: pawn.id,
-                properties: { transform: { x: pose.x - rect.width / 2, y: pose.y - rect.height / 2 } },
-            },
-        ],
-    });
 }
 
 function setViewWanted(stage: Stage, wanted: boolean): void {
