@@ -260,4 +260,16 @@ describe("the driver against a fake Drawdy", () => {
         await vi.advanceTimersByTimeAsync(150);
         expect(writes(socket).at(-1)).toMatchObject({ type: "scene.commit", upserts: [{ id: "w", rect: { x: 320 } }] });
     });
+
+    it("relays the cursors from the board's user list as soon as it becomes the writer", async () => {
+        const fake = new FakeDrawdy([frame]);
+        fake.users = [
+            ...fake.users,
+            { id: "friend", name: "Ploy", color: "#0ca678", isHost: false, isSelf: false, cursorPosition: { x: 5, y: 6 } },
+        ];
+        const { socket } = await startDriver(fake);
+        expect(socket.sent.filter((m) => m.type === "cursors")).toEqual([
+            { type: "cursors", epoch: 1, cursors: [{ presenceId: "friend", name: "Ploy", color: "#0ca678", x: 5, y: 6 }] },
+        ]);
+    });
 });

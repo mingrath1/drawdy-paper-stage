@@ -191,6 +191,8 @@ async function openStage(): Promise<Stage | null> {
         viewOpen: false,
         dropped: { cutouts: 0, items: 0, tooBig: 0 },
     };
+    // Presence fires only on change; the relay keeps this list for the moment it becomes the writer.
+    if (users.ok) stage.relay.sendCursors(cursorsOf(users.value.users));
     return stage;
 }
 
