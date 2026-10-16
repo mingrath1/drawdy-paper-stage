@@ -134,7 +134,7 @@ renderer.setAnimationLoop(() => {
         poseClock = step.clock;
         if (step.send) link.send({ type: "pose", pose: step.send });
     }
-    stage.update(dt);
+    stage.update(dt, walk.position);
     if (frame) {
         bodies.update(dt, now, frame);
         hands.update(dt, now / 1000, frame);
