@@ -146,7 +146,7 @@ export class WriterSession {
 
 export const SEND_GAP_MS = 50;
 export const ACK_TIMEOUT_MS = 5_000;
-const LIMIT_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000];
+const THROTTLE_MS = 1_000;
 
 const isCommit = (message: WriterMessage) => message.type === "scene.commit";
 const isUpload = (message: WriterMessage) => message.type === "asset.put";
@@ -163,7 +163,6 @@ export class Outbox {
     private queue: WriterMessage[] = [];
     private inFlight: { message: WriterMessage; sentAt: number }[] = [];
     private nextSendAt = 0;
-    private limits = 0;
 
     constructor(private readonly now: () => number = Date.now) {}
 
@@ -187,27 +186,18 @@ export class Outbox {
      * socket in order, so anything sent before the acked message and still unanswered was dropped. Returns null for
      * an ack this outbox no longer waits on: a second answer to a resent upload, or one for a message it gave up on.
      */
-    settle(requestId: string, limited: boolean): { message: WriterMessage; lost: boolean } | null {
+    settle(requestId: string): { message: WriterMessage; lost: boolean } | null {
         const index = this.inFlight.findIndex((entry) => entry.message.requestId === requestId);
         if (index < 0) return null;
         const dropped = this.inFlight.splice(0, index).map((entry) => entry.message);
         const answered = this.inFlight.shift()!.message;
-        let lost = dropped.some(isCommit);
-        const replay: WriterMessage[] = dropped.filter(isUpload);
-        if (limited) {
-            const later = this.inFlight.splice(0).map((entry) => entry.message);
-            if (isUpload(answered) || !later.some(isCommit)) replay.push(answered, ...later);
-            else {
-                lost = true;
-                replay.push(...[answered, ...later].filter(isUpload));
-            }
-            const backoff = LIMIT_BACKOFF_MS[Math.min(this.limits++, LIMIT_BACKOFF_MS.length - 1)];
-            this.nextSendAt = Math.max(this.nextSendAt, this.now() + backoff);
-        } else {
-            this.limits = 0;
-        }
-        this.queue.unshift(...replay);
-        return { message: answered, lost };
+        this.queue.unshift(...dropped.filter(isUpload));
+        return { message: answered, lost: dropped.some(isCommit) };
+    }
+
+    /** The server is dropping this socket's messages, and refills its budget within a second. */
+    throttle(): void {
+        this.nextSendAt = Math.max(this.nextSendAt, this.now() + THROTTLE_MS);
     }
 
     /**
@@ -232,7 +222,6 @@ export class Outbox {
     clear(): void {
         this.queue = [];
         this.inFlight = [];
-        this.limits = 0;
     }
 }
 
@@ -394,11 +383,10 @@ export class Relay {
                 this.applyWriter(entry, message.writer);
                 return;
             case "ack": {
-                const limited = !message.ok && message.error === "limit";
-                const settled = this.outbox.settle(message.requestId, limited);
+                const settled = this.outbox.settle(message.requestId);
                 // A late answer can carry a stale_epoch from before a re-election; it says nothing about now.
                 if (!settled || settled.message.epoch !== this.session.epoch) return;
-                if (!message.ok && !limited) {
+                if (!message.ok) {
                     if (this.session.onRejected(message.error)) this.outbox.dropCommits();
                     else this.outbox.clear();
                     this.handlers.rejected(message.error, message.message);
@@ -419,6 +407,8 @@ export class Relay {
                 this.handlers.walkerLeft(message.connectionId);
                 return;
             case "error":
+                // Throttling drops a message without an ack; an ack with error `limit` is a stage cap instead.
+                if (message.code === "limit") this.outbox.throttle();
                 console.warn(`[paper-stage] stage server error ${message.code}: ${message.message}`);
                 return;
             case "cursors":

@@ -562,6 +562,46 @@ describe("Relay", () => {
         ]);
     });
 
+    it("takes a limit ack as a stage cap: reports it, never replays the commit, and resets on the next sync", () => {
+        const { relay, socket } = connect();
+        elect(socket);
+        relay.commit(1, desired([wall("w")]));
+        const [first] = sentCommits(socket);
+        socket.receive({
+            type: "ack",
+            requestId: first.requestId,
+            ok: false,
+            error: "limit",
+            message: "a stage holds at most 400 items",
+        });
+        expect(handlers.rejected).toHaveBeenCalledWith("limit", "a stage holds at most 400 items");
+        vi.advanceTimersByTime(20_000);
+        expect(sentCommits(socket)).toHaveLength(1);
+        relay.commit(1, desired([wall("w")]));
+        vi.advanceTimersByTime(SEND_GAP_MS);
+        expect(sentCommits(socket).slice(1)).toMatchObject([{ reset: true, upserts: [wall("w")] }]);
+    });
+
+    it("pauses for a second when the server says it is dropping this socket's messages", () => {
+        const { relay, socket } = connect();
+        elect(socket);
+        const shots = ["h1", "h2", "h3"].map((hash, i) => cutout(`c${i}`, hash));
+        relay.commit(
+            1,
+            desired(
+                shots.map((shot) => shot.item),
+                shots.map((shot) => shot.asset),
+            ),
+        );
+        const writes = () => socket.sent.filter((m) => m.type === "asset.put" || m.type === "scene.commit").length;
+        expect(writes()).toBe(1);
+        socket.receive({ type: "error", code: "limit", message: "more than 60 messages per second; dropping" });
+        vi.advanceTimersByTime(1_000 - 1);
+        expect(writes()).toBe(1);
+        vi.advanceTimersByTime(1);
+        expect(writes()).toBe(2);
+    });
+
     it("resyncs the newest scene when a later ack shows the server dropped a commit", () => {
         const { relay, socket } = connect();
         elect(socket);
@@ -637,54 +677,13 @@ describe("Outbox", () => {
         const outbox = new Outbox(clock);
         outbox.push([put("p"), commit("c1"), commit("c2")]);
         for (let i = 0; i < 3; i++, now += SEND_GAP_MS) drain(outbox);
-        expect(outbox.settle("c1", false)?.lost).toBe(false);
+        expect(outbox.settle("c1")?.lost).toBe(false);
         expect(drain(outbox)).toEqual(["p"]);
 
         const second = new Outbox(clock);
         second.push([commit("c1"), commit("c2")]);
         for (let i = 0; i < 2; i++, now += SEND_GAP_MS) drain(second);
-        expect(second.settle("c2", false)?.lost).toBe(true);
+        expect(second.settle("c2")?.lost).toBe(true);
     });
 
-    it("replays a rate-limited commit under its requestId after a backoff", () => {
-        const outbox = new Outbox(clock);
-        outbox.push([commit("c1"), put("p")]);
-        for (let i = 0; i < 2; i++, now += SEND_GAP_MS) drain(outbox);
-        expect(outbox.settle("c1", true)?.lost).toBe(false);
-        expect(outbox.take()).toEqual({ waitMs: 1_000 });
-        now += 1_000;
-        expect(drain(outbox)).toEqual(["c1"]);
-        now += SEND_GAP_MS;
-        expect(drain(outbox)).toEqual(["p"]);
-    });
-
-    it("resyncs instead of replaying a limited commit that a newer commit may overtake", () => {
-        const outbox = new Outbox(clock);
-        outbox.push([commit("c1"), put("p"), commit("c2")]);
-        for (let i = 0; i < 3; i++, now += SEND_GAP_MS) drain(outbox);
-        expect(outbox.settle("c1", true)?.lost).toBe(true);
-        now += 1_000;
-        expect(drain(outbox)).toEqual(["p"]);
-        now += SEND_GAP_MS;
-        expect(outbox.take()).toBeNull();
-    });
-
-    it("backs off longer on repeated limits and resets after a success", () => {
-        const outbox = new Outbox(clock);
-        outbox.push([commit("c1")]);
-        drain(outbox);
-        outbox.settle("c1", true);
-        now += 1_000;
-        drain(outbox);
-        outbox.settle("c1", true);
-        expect(outbox.take()).toEqual({ waitMs: 2_000 });
-        now += 2_000;
-        drain(outbox);
-        outbox.settle("c1", false);
-        outbox.push([commit("c2")]);
-        now += SEND_GAP_MS;
-        drain(outbox);
-        outbox.settle("c2", true);
-        expect(outbox.take()).toEqual({ waitMs: 1_000 });
-    });
 });
