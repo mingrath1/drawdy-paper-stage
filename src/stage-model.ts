@@ -68,7 +68,7 @@ export function rectOf(element: BoardElement): Rect | null {
 }
 
 export function belongsToStage(element: BoardElement, frameId: ElementId, frame: Rect): boolean {
-    if (element.frameId === frameId) return true;
+    if (element.frameId) return element.frameId === frameId;
     const rect = rectOf(element);
     if (!rect) return false;
     const cx = rect.x + rect.width / 2;
