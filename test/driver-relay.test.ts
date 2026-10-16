@@ -562,6 +562,33 @@ describe("Relay", () => {
         ]);
     });
 
+    it("keeps only the newest board while a batch drains, then sends one diff with its uploads first", () => {
+        const { relay, socket } = connect();
+        elect(socket);
+        const shots = Array.from({ length: 10 }, (_, i) => cutout(`c${i}`, `h${i}`));
+        const late = cutout("late", "h-late");
+        const board = (x: number, extra: typeof shots = []) =>
+            desired(
+                [wall("w", x), ...[...shots, ...extra].map((shot) => shot.item)],
+                [...shots, ...extra].map((shot) => shot.asset),
+            );
+        relay.commit(1, board(10));
+        for (let x = 11; x <= 19; x++) {
+            vi.advanceTimersByTime(SEND_GAP_MS);
+            relay.commit(1, board(x, x >= 15 ? [late] : []));
+        }
+        vi.advanceTimersByTime(SEND_GAP_MS * 20);
+        const writes = socket.sent.filter((m) => m.type === "asset.put" || m.type === "scene.commit");
+        expect(writes.map((m) => m.type)).toEqual([
+            ...shots.map(() => "asset.put"),
+            "scene.commit",
+            "asset.put",
+            "scene.commit",
+        ]);
+        expect(writes.at(-2)).toMatchObject({ hash: "h-late" });
+        expect(writes.at(-1)).toMatchObject({ upserts: [wall("w", 19), late.item], removes: [] });
+    });
+
     it("takes a limit ack as a stage cap: reports it, never replays the commit, and resets on the next sync", () => {
         const { relay, socket } = connect();
         elect(socket);

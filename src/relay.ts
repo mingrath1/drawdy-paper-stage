@@ -170,6 +170,11 @@ export class Outbox {
         this.queue.push(...messages);
     }
 
+    /** True once every queued message went out. */
+    get drained(): boolean {
+        return this.queue.length === 0;
+    }
+
     /** The next message pacing allows, how long until it may go, or null when nothing waits. */
     take(): { message: WriterMessage } | { waitMs: number } | null {
         if (this.queue.length === 0) return null;
@@ -264,6 +269,8 @@ export class Relay {
     private storedAssets = new Set<AssetHash>();
     /** The newest board this writer was asked to commit, which a resync replaces the stored stage with. */
     private desired: DesiredStage | null = null;
+    /** `desired` changed since the last plan. */
+    private dirty = false;
 
     constructor(
         private readonly backendUrl: string,
@@ -292,7 +299,7 @@ export class Relay {
     commit(epoch: number, desired: DesiredStage): void {
         if (epoch !== this.writerEpoch) return;
         this.desired = desired;
-        this.outbox.push(this.session.plan(epoch, desired));
+        this.dirty = true;
         this.pump();
     }
 
@@ -300,8 +307,7 @@ export class Relay {
     private resync(): void {
         this.outbox.dropCommits();
         this.session.resync();
-        const epoch = this.writerEpoch;
-        if (epoch !== null && this.desired) this.outbox.push(this.session.plan(epoch, this.desired));
+        this.dirty = true;
         this.pump();
     }
 
@@ -312,7 +318,16 @@ export class Relay {
 
     private pump(): void {
         if (this.pumpTimer) return;
-        for (let next = this.outbox.take(); next; next = this.outbox.take()) {
+        for (;;) {
+            // A new plan waits until the last batch went out, so a board that changes faster than the outbox drains
+            // coalesces into its newest state instead of queueing every step.
+            const epoch = this.writerEpoch;
+            if (this.dirty && this.outbox.drained && epoch !== null && this.desired) {
+                this.dirty = false;
+                this.outbox.push(this.session.plan(epoch, this.desired));
+            }
+            const next = this.outbox.take();
+            if (!next) return;
             if ("waitMs" in next) {
                 this.pumpTimer = setTimeout(() => {
                     this.pumpTimer = null;
