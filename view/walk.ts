@@ -32,7 +32,7 @@ export type Ground = { frame: Rect | null; pawn: Point | null; collisionEdges: S
 export class WalkControls {
     position: Point = { x: 0, z: 0 };
     /** Whether the walker has stood at the pawn yet. Until then it waits at the floor's center. */
-    spawned = false;
+    private spawned = false;
     heading = Math.PI;
     pitch = 0;
     walked = false;
