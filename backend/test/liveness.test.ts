@@ -1,6 +1,38 @@
+import { runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { CLOSE } from "../../shared/protocol.ts";
-import { connect, freshStage, hello, join, TOKEN, writerOf } from "./stage-client.ts";
+import { CLOSE, type ServerMessage } from "../../shared/protocol.ts";
+import {
+  type Client,
+  commit,
+  connect,
+  freshStage,
+  hello,
+  join,
+  TOKEN,
+  wall,
+  writerOf,
+} from "./stage-client.ts";
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Pings every 5 s like a live driver, and returns the first frame of `type` it receives. */
+async function pingUntil<T extends ServerMessage["type"]>(
+  client: Client,
+  type: T,
+  timeoutMs: number,
+): Promise<Extract<ServerMessage, { type: T }>> {
+  const pinger = setInterval(() => client.send({ type: "ping", t: 0 }), 5_000);
+  try {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const message = await client.next(deadline - Date.now());
+      if (message.type === type) return message as Extract<ServerMessage, { type: T }>;
+    }
+  } finally {
+    clearInterval(pinger);
+  }
+}
 
 describe("socket caps", () => {
   it("refuses a socket past 64 on one stage with a retryable close", async () => {
@@ -48,4 +80,77 @@ describe.concurrent("liveness", () => {
     expect(Date.now() - connectedAt).toBeGreaterThanOrEqual(9_500);
     await writer.expectQuiet();
   });
+
+  it(
+    "hands the seat from a writer silent for 30 s to a driver still pinging",
+    { timeout: 45_000 },
+    async () => {
+      const stageId = freshStage();
+      const zombie = await writerOf(stageId);
+      const awake = await join(stageId, "driver", "awake");
+      const { client: view } = await join(stageId, "view");
+      const startedAt = Date.now();
+
+      const { writer } = await pingUntil(awake.client, "writer", 40_000);
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(29_000);
+      expect(writer).toEqual({ connectionId: awake.welcome.connectionId, epoch: zombie.epoch + 1 });
+      expect((await view.expect("writer")).writer).toEqual(writer);
+
+      zombie.client.send(commit(zombie.epoch, "late", { upserts: [wall("a")] }));
+      expect((await zombie.client.expect("writer")).writer).toEqual(writer);
+      expect(await zombie.client.expect("ack")).toMatchObject({ ok: false, error: "not_writer" });
+      awake.client.send(commit(writer.epoch, "fresh", { upserts: [wall("a")] }));
+      expect(await awake.client.expect("ack")).toMatchObject({ ok: true, revision: 1 });
+    },
+  );
+
+  it(
+    "re-runs the election on a refused commit before the sweep runs",
+    { timeout: 45_000 },
+    async () => {
+      const { zombie, awake } = await silentWriterWithoutSweep();
+      awake.client.send(commit(zombie.epoch, "early", { upserts: [wall("a")] }));
+      expect(await awake.client.expect("ack")).toMatchObject({ ok: false, error: "not_writer" });
+      const { writer } = await awake.client.expect("writer");
+      expect(writer).toEqual({ connectionId: awake.welcome.connectionId, epoch: zombie.epoch + 1 });
+    },
+  );
+
+  it(
+    "re-runs the election on a driver hello before the sweep runs",
+    { timeout: 45_000 },
+    async () => {
+      const { stageId, zombie, awake } = await silentWriterWithoutSweep();
+      const late = await join(stageId, "driver", "late");
+      expect(late.welcome.writer).toEqual({
+        connectionId: zombie.connectionId,
+        epoch: zombie.epoch,
+      });
+      const { writer } = await awake.client.expect("writer");
+      expect(writer).toEqual({ connectionId: awake.welcome.connectionId, epoch: zombie.epoch + 1 });
+    },
+  );
 });
+
+/** A stage whose writer has been silent for 31 s while another driver pinged, with the alarm sweep switched off. */
+async function silentWriterWithoutSweep() {
+  const stageId = freshStage();
+  const zombie = await writerOf(stageId);
+  const awake = await join(stageId, "driver", "awake");
+  const pinger = setInterval(() => awake.client.send({ type: "ping", t: 0 }), 5_000);
+  try {
+    await sleep(25_000);
+    await runInDurableObject(env.STAGES.getByName(stageId), (_instance, state) =>
+      state.storage.deleteAlarm(),
+    );
+    await sleep(6_000);
+  } finally {
+    clearInterval(pinger);
+  }
+  for (;;) {
+    const message = await awake.client.next(200).catch(() => undefined);
+    if (message === undefined) break;
+    expect(message.type).toBe("pong");
+  }
+  return { stageId, zombie, awake };
+}

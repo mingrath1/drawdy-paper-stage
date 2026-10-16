@@ -51,6 +51,8 @@ export const STAGE_ID_HEADER = "x-paper-stage-id";
 const RECOVERY_ALARM_DELAY_MS = 60_000;
 /** The alarm sweep closes a socket that has not said hello by then. */
 const HELLO_TIMEOUT_MS = 10_000;
+/** Drivers ping every 10 s, so a writer silent this long is asleep or gone and loses its seat. */
+const WRITER_TIMEOUT_MS = 30_000;
 /** Also bounds the walkers a welcome lists, which keeps a welcome far under MAX_FRAME_CHARACTERS. */
 const MAX_SOCKETS_PER_STAGE = 64;
 const MAX_SOCKETS_PER_PRESENCE = 8;
@@ -85,7 +87,7 @@ const ControlDoc = defineDoc<ControlState>({
 });
 
 type Member =
-  | { readonly role: "driver"; readonly participant: Participant }
+  | { readonly role: "driver"; readonly participant: Participant; readonly lastSeenAt: number }
   | { readonly role: "view"; readonly participant: Participant; readonly pose: Pose | null };
 
 /** Kept in the WebSocket attachment, so it survives hibernation. */
@@ -98,6 +100,7 @@ type Connection = {
 };
 
 type Joined = Connection & { readonly member: Member };
+type Driver = Connection & { readonly member: Extract<Member, { role: "driver" }> };
 
 /** Errors that end the connection, and the close code each uses unless the caller names another. */
 const CLOSE_CODES = {
@@ -131,6 +134,11 @@ const reciprocateClose = (socket: WebSocket, code: number, reason: string): void
 
 const byJoinOrder = (left: Connection, right: Connection): number =>
   left.connectedAt - right.connectedAt || left.connectionId.localeCompare(right.connectionId);
+
+const isLiveDriver =
+  (now: number) =>
+  (connection: Joined): connection is Driver =>
+    connection.member.role === "driver" && now - connection.member.lastSeenAt < WRITER_TIMEOUT_MS;
 
 export class Stage extends DurableObject<Env> {
   #harness!: Harness;
@@ -229,7 +237,7 @@ export class Stage extends DurableObject<Env> {
     await this.#refreshAlarm();
   }
 
-  /** Closes sockets that never said hello. */
+  /** Closes sockets that never said hello and re-runs the election, so a silent writer loses its seat. */
   async #sweep(): Promise<void> {
     const now = Date.now();
     const late = this.#openSockets().filter((socket) => {
@@ -245,6 +253,7 @@ export class Stage extends DurableObject<Env> {
         }),
       ),
     );
+    await this.#stageOperations.run("stage", () => this.#electWriter());
   }
 
   override async webSocketMessage(socket: WebSocket, frame: string | ArrayBuffer): Promise<void> {
@@ -293,6 +302,12 @@ export class Stage extends DurableObject<Env> {
     if (this.#departed.has(socket)) return;
     const now = Date.now();
     const connection = this.#connection(socket);
+    if (connection.member?.role === "driver") {
+      this.#setConnection(socket, {
+        ...connection,
+        member: { ...connection.member, lastSeenAt: now },
+      });
+    }
     if (typeof frame !== "string") {
       return this.#disconnect(socket, "bad_message", "binary frames are not supported");
     }
@@ -370,6 +385,10 @@ export class Stage extends DurableObject<Env> {
       return this.#disconnect(socket, "bad_message", "send hello first");
     }
     const joined = connection as Joined;
+    if (joined.member.role === "driver" && this.#control.writer.connectionId === null) {
+      // The seat empties when every driver went silent, so the first one heard from again takes it.
+      await this.#stageOperations.run("stage", () => this.#electWriter());
+    }
 
     switch (message.type) {
       case "scene.commit":
@@ -433,7 +452,7 @@ export class Stage extends DurableObject<Env> {
 
     const member: Member =
       hello.role === "driver"
-        ? { role: "driver", participant: hello.participant }
+        ? { role: "driver", participant: hello.participant, lastSeenAt: Date.now() }
         : { role: "view", participant: hello.participant, pose: null };
     const connection = this.#connection(socket);
     this.#setConnection(socket, { ...connection, member });
@@ -463,21 +482,25 @@ export class Stage extends DurableObject<Env> {
     return "ok";
   }
 
-  /** Keeps the writer while its socket is joined, else hands the role to the longest-connected driver. */
+  /**
+   * Keeps the writer while it is joined and heard from in the last WRITER_TIMEOUT_MS, else hands the role to the
+   * longest-connected driver that is, or to nobody. Runs only inside a stage operation.
+   */
   async #electWriter(): Promise<void> {
     const current = this.#control.writer;
     const drivers = this.#members()
       .map(([, connection]) => connection)
-      .filter((connection) => connection.member.role === "driver");
+      .filter(isLiveDriver(Date.now()));
     if (drivers.some((driver) => driver.connectionId === current.connectionId)) return;
-    const next = drivers.sort(byJoinOrder)[0]?.connectionId ?? null;
-    if (next === null && current.connectionId === null) return;
+    const next = drivers.sort(byJoinOrder)[0];
+    if (next === undefined && current.connectionId === null) return;
 
-    const writer: Writer = { connectionId: next, epoch: current.epoch + 1 };
+    const writer: Writer = { connectionId: next?.connectionId ?? null, epoch: current.epoch + 1 };
     await this.#updateControl((control) => {
       control.writer = writer;
     });
     this.#broadcast({ type: "writer", writer });
+    if (next !== undefined) await this.#alarmBy(next.member.lastSeenAt + WRITER_TIMEOUT_MS);
   }
 
   async #commit(
@@ -488,7 +511,8 @@ export class Stage extends DurableObject<Env> {
     const { requestId, epoch } = commit;
     const writerRefusal = this.#writerRefusal(connection, epoch);
     if (writerRefusal !== undefined) {
-      return this.#send(socket, { type: "ack", requestId, ...writerRefusal });
+      this.#send(socket, { type: "ack", requestId, ...writerRefusal });
+      return this.#electWriter();
     }
     const digest = await sha256Hex(commitPayload(commit));
     const receipt = findReceipt(this.#receipts, epoch, requestId);
@@ -535,7 +559,8 @@ export class Stage extends DurableObject<Env> {
     const accepted = { type: "ack", requestId, ok: true, revision: this.#scene.revision } as const;
     const writerRefusal = this.#writerRefusal(connection, put.epoch);
     if (writerRefusal !== undefined) {
-      return this.#send(socket, { type: "ack", requestId, ...writerRefusal });
+      this.#send(socket, { type: "ack", requestId, ...writerRefusal });
+      return this.#electWriter();
     }
     const stored = Object.hasOwn(this.#control.assets, hash)
       ? this.#control.assets[hash]
@@ -744,11 +769,16 @@ export class Stage extends DurableObject<Env> {
     });
   }
 
-  /** When the sweep has work: the hello deadline of each socket that has not said hello. */
+  /** When the sweep has work: a hello deadline, or the moment the writer's silence would cost it the seat. */
   #sweepDeadlines(): number[] {
+    const writer = this.#control.writer.connectionId;
     return this.#openSockets().flatMap((socket) => {
-      const { connectedAt, member } = this.#connection(socket);
-      return member === null ? [connectedAt + HELLO_TIMEOUT_MS] : [];
+      const { connectionId, connectedAt, member } = this.#connection(socket);
+      if (member === null) return [connectedAt + HELLO_TIMEOUT_MS];
+      if (member.role === "driver" && connectionId === writer) {
+        return [member.lastSeenAt + WRITER_TIMEOUT_MS];
+      }
+      return [];
     });
   }
 
