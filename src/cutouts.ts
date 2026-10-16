@@ -180,8 +180,9 @@ export async function captureCutout(host: Host, area: Rect, board: readonly Rect
     const bounds = exportBounds(area, board);
     const shot = await host.call("command:scene:capture-screenshot", { area });
     if (!shot.ok || !bounds) return { ok: false, reason: "failed" };
-    const bitmap = await createImageBitmap(shot.value.png);
+    let bitmap: ImageBitmap | null = null;
     try {
+        bitmap = await createImageBitmap(shot.value.png);
         const crop = cropInExport(area, bounds, bitmap);
         if (!crop) {
             console.warn(`[paper-stage] export ${bitmap.width}x${bitmap.height} does not match bounds`, bounds);
@@ -195,8 +196,11 @@ export async function captureCutout(host: Host, area: Rect, board: readonly Rect
             }
         }
         return { ok: false, reason: "too_big" };
+    } catch (err) {
+        console.warn("[paper-stage] could not cut out a capture", err);
+        return { ok: false, reason: "failed" };
     } finally {
-        bitmap.close();
+        bitmap?.close();
     }
 }
 

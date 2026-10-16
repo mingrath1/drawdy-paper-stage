@@ -1,14 +1,17 @@
+import type { DriverCommandIssuer, DriverCommandRequest, ModuleStyling } from "@drawdy/driver-protocol";
 import { createHash, randomBytes } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
     bytesToBase64,
     captureArea,
+    captureCutout,
     contentHash,
     cropInExport,
     CutoutCache,
     exportBounds,
     sha256Hex,
 } from "../src/cutouts";
+import { Host } from "../src/host";
 import type { BoardElement } from "../src/stage-model";
 
 const doodle: BoardElement = {
@@ -110,6 +113,41 @@ describe("exportBounds and cropInExport", () => {
 
     it("has nothing to export when the area touches nothing", () => {
         expect(exportBounds({ x: 0, y: 0, width: 10, height: 10 }, [{ x: 50, y: 50, width: 5, height: 5 }])).toBeNull();
+    });
+});
+
+describe("captureCutout", () => {
+    const area = { x: 0, y: 0, width: 48, height: 28 };
+    const host = new Host(
+        ((request: DriverCommandRequest) =>
+            Promise.resolve({ ...request, res: { value: { png: new Blob(["not a png"]) } } })) as DriverCommandIssuer,
+        "d",
+        {} as ModuleStyling,
+    );
+
+    afterEach(() => vi.unstubAllGlobals());
+
+    it("reports a picture it cannot decode as failed instead of throwing", async () => {
+        vi.stubGlobal("createImageBitmap", () => Promise.reject(new Error("The source image could not be decoded.")));
+        await expect(captureCutout(host, area, [area])).resolves.toEqual({ ok: false, reason: "failed" });
+    });
+
+    it("reports a picture it cannot encode as failed instead of throwing", async () => {
+        const close = vi.fn();
+        vi.stubGlobal("createImageBitmap", () => Promise.resolve({ width: 88, height: 68, close }));
+        vi.stubGlobal(
+            "OffscreenCanvas",
+            class {
+                getContext() {
+                    return { drawImage() {} };
+                }
+                convertToBlob() {
+                    return Promise.reject(new Error("canvas is too large"));
+                }
+            },
+        );
+        await expect(captureCutout(host, area, [area])).resolves.toEqual({ ok: false, reason: "failed" });
+        expect(close).toHaveBeenCalledOnce();
     });
 });
 
