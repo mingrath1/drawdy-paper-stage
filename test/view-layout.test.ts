@@ -8,6 +8,7 @@ import {
     floorBounds,
     handPlan,
     moveWalker,
+    openHeading,
     refloor,
     settleWalker,
     wallEdges,
@@ -189,6 +190,30 @@ describe("settling a walker after the stage changes", () => {
             wall({ x: 1300, y: 2400 + (k - 6) * 40 - 6, width: 700, height: 12 }),
         );
         expect(settle({ x: 0, z: 0.05 }, slats)).toEqual(home);
+    });
+});
+
+describe("the heading a walker spawns with", () => {
+    const box = (minX: number, maxX: number, minZ: number, maxZ: number) => {
+        const corners = [
+            { x: minX, z: minZ },
+            { x: maxX, z: minZ },
+            { x: maxX, z: maxZ },
+            { x: minX, z: maxZ },
+        ];
+        return corners.map((a, i) => ({ a, b: corners[(i + 1) % 4] }));
+    };
+    const floor = { minX: -5, maxX: 5, minZ: -3, maxZ: 3 };
+
+    it("looks into a room, not at the wall beside a doorway", () => {
+        const partition = [...box(-0.06, 0.06, -3, -0.6), ...box(-0.06, 0.06, 0.6, 3)];
+        const heading = openHeading({ x: 0, z: 0 }, partition, floor);
+        expect(Math.abs(Math.sin(heading))).toBeGreaterThan(0.9);
+    });
+
+    it("looks across the floor from beside its edge", () => {
+        expect(Math.cos(openHeading({ x: 0, z: 2.9 }, [], floor))).toBeLessThan(-0.5);
+        expect(Math.cos(openHeading({ x: 0, z: -2.9 }, [], floor))).toBeGreaterThan(0.5);
     });
 });
 

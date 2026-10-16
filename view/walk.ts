@@ -1,6 +1,6 @@
 import { EYE_HEIGHT_METERS, headingToCameraYaw, worldToCanvas, type Pose, type Rect } from "../shared/protocol";
 import type { PerspectiveCamera } from "./vendor/three.module.js";
-import { clamp, moveWalker, refloor, settleWalker, type Bounds, type Point, type Segment } from "./layout";
+import { clamp, moveWalker, openHeading, refloor, settleWalker, type Bounds, type Point, type Segment } from "./layout";
 import { PITCH_LIMIT, normalizeHeading } from "./pose";
 
 const WALK_SPEED = 2.6;
@@ -83,6 +83,7 @@ export class WalkControls {
         if (!frame) return;
         if (!this.spawned && pawn) {
             this.position = pawn;
+            this.heading = openHeading(pawn, ground.collisionEdges, ground.bounds);
             this.spawned = true;
         } else if (before) {
             this.position = refloor(this.position, before, frame);

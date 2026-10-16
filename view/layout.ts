@@ -181,6 +181,37 @@ function nearestOn({ a, b }: Segment, p: Point): Point {
 const SETTLE_REACH_M = 2;
 const SETTLE_DIRECTIONS = 16;
 
+/**
+ * The heading, as `Pose` measures it, with the longest clear sightline from `at` to a wall or the floor's edge, so a
+ * walker spawning in a doorway looks into a room instead of at the wall beside it. Ties keep the earliest of
+ * SETTLE_DIRECTIONS headings, counting from facing -z.
+ */
+export function openHeading(at: Point, edges: Segment[], bounds: Bounds): number {
+    let best = { heading: Math.PI, reach: -1 };
+    for (let i = 0; i < SETTLE_DIRECTIONS; i++) {
+        const heading = Math.PI - (i / SETTLE_DIRECTIONS) * Math.PI * 2;
+        const reach = sightline(at, { x: Math.sin(heading), z: Math.cos(heading) }, edges, bounds);
+        if (reach > best.reach + 1e-9) best = { heading, reach };
+    }
+    return best.heading;
+}
+
+function sightline(from: Point, dir: Point, edges: Segment[], { minX, maxX, minZ, maxZ }: Bounds): number {
+    const toBound = (p: number, d: number, min: number, max: number) =>
+        d > 0 ? (max - p) / d : d < 0 ? (min - p) / d : Infinity;
+    let reach = Math.min(toBound(from.x, dir.x, minX, maxX), toBound(from.z, dir.z, minZ, maxZ));
+    for (const { a, b } of edges) {
+        const ex = b.x - a.x;
+        const ez = b.z - a.z;
+        const denominator = dir.x * ez - dir.z * ex;
+        if (Math.abs(denominator) < 1e-12) continue;
+        const t = ((a.x - from.x) * ez - (a.z - from.z) * ex) / denominator;
+        const u = ((a.x - from.x) * dir.z - (a.z - from.z) * dir.x) / denominator;
+        if (t > 0 && u >= 0 && u <= 1) reach = Math.min(reach, t);
+    }
+    return reach;
+}
+
 /** How many walls cover `p`, as the winding number of the edges around it. */
 function wallsUnder(p: Point, edges: Segment[]): number {
     let winding = 0;
