@@ -20,7 +20,11 @@ type RequestOf<T extends CommandType> = CommandOf<T> extends { req: infer Q } ? 
 type ValueOf<T extends CommandType> = Extract<CommandOf<T>["res"], { value: unknown }>["value"];
 export type RequestArgs<T extends CommandType> = RequestOf<T> extends undefined ? [] : [RequestOf<T>];
 
-export type CommandFailure = { ok: false; error: ProtocolCommandError["type"] | "timeout"; message: string };
+export type CommandFailure = {
+    ok: false;
+    error: ProtocolCommandError["type"] | "timeout" | "stopped";
+    message: string;
+};
 export type CommandResult<T extends CommandType> = { ok: true; value: ValueOf<T> } | CommandFailure;
 
 type GatedPermission = "scene" | "dom" | "collaboration";
@@ -49,18 +53,28 @@ function permissionOf(type: CommandType): GatedPermission | null {
     return PERMISSION_BY_PREFIX.find(([prefix]) => type.startsWith(prefix))?.[1] ?? null;
 }
 
-/** The one door to Drawdy. Every command resolves to a result, times out instead of hanging, and explains denials. */
+const STOPPED: CommandFailure = { ok: false, error: "stopped", message: "Paper Stage was reloaded" };
+
+/**
+ * One instance's door to Drawdy. Every command resolves to a result, times out instead of hanging, and explains
+ * denials. The door opens once the previous instance's host has stopped, and closes for good when this one stops.
+ */
 export class Host {
     private seq = 0;
     private hintTimer: ReturnType<typeof setTimeout> | null = null;
     private shownHint: string | null = null;
+    private stopping: Promise<void> | null = null;
     private readonly decided = new Set<GatedPermission>();
+    /** What this host put on the person's screen, so stop can take it down. */
+    private readonly floating = new Set<string>();
+    private readonly previews = new Set<string>();
     readonly palette: Palette;
 
     constructor(
         private readonly issueCommand: DriverCommandIssuer,
         private readonly driverId: string,
         styling: ModuleStyling,
+        private readonly previousStopped: Promise<unknown> = Promise.resolve(),
     ) {
         this.palette = paletteOf(styling);
     }
@@ -68,12 +82,39 @@ export class Host {
     /** Issues a command and reports failures to the user. */
     async run<T extends CommandType>(type: T, ...args: RequestArgs<T>): Promise<CommandResult<T>> {
         const result = await this.call(type, ...args);
-        if (!result.ok) await this.report(type, result);
+        if (!result.ok && result.error !== "stopped") await this.report(type, result);
         return result;
     }
 
-    /** Issues a command without reporting failures. */
-    async call<T extends CommandType>(type: T, ...[req]: RequestArgs<T>): Promise<CommandResult<T>> {
+    /** Issues a command without reporting failures. Once the host stops, it reaches no one and nothing comes back. */
+    async call<T extends CommandType>(type: T, ...args: RequestArgs<T>): Promise<CommandResult<T>> {
+        await this.previousStopped;
+        if (this.stopping) return STOPPED;
+        const result = await this.send(type, ...args);
+        return this.stopping ? STOPPED : result;
+    }
+
+    /**
+     * Closes the door at once, then takes down what this host put on the screen. Those are the last commands it
+     * sends, apart from deleting a preview whose create Drawdy answers later. Every later stop returns the same
+     * promise.
+     */
+    stop(): Promise<void> {
+        return (this.stopping ??= this.takeDown());
+    }
+
+    private async takeDown(): Promise<void> {
+        if (this.hintTimer) clearTimeout(this.hintTimer);
+        await this.previousStopped;
+        for (const domId of [...this.floating]) await this.send("command:dom:remove-floating-element", { domId });
+        await this.deletePreviews([...this.previews]);
+    }
+
+    private async deletePreviews(previewIds: string[]): Promise<void> {
+        if (previewIds.length > 0) await this.send("command:scene:delete-drawdy-preview-elements", { previewIds });
+    }
+
+    private async send<T extends CommandType>(type: T, ...[req]: RequestArgs<T>): Promise<CommandResult<T>> {
         const request = {
             type,
             driverId: this.driverId,
@@ -86,8 +127,15 @@ export class Host {
         const timeout = new Promise<"timeout">((resolve) => {
             timer = setTimeout(() => resolve("timeout"), limitMs);
         });
+        this.noteIssued(request);
         try {
-            const response = await Promise.race([this.issueCommand(request), timeout]);
+            const answered = this.issueCommand(request).then((response) => {
+                const res = response.res as { value?: unknown; error?: unknown };
+                if (!res.error) this.noteDone(request, res.value);
+                return response;
+            });
+            answered.catch(() => undefined);
+            const response = await Promise.race([answered, timeout]);
             if (response === "timeout") {
                 return {
                     ok: false,
@@ -104,6 +152,27 @@ export class Host {
         } finally {
             clearTimeout(timer);
         }
+    }
+
+    /** A floating element counts as up from the moment it is asked for, since Drawdy applies commands in order. */
+    private noteIssued(request: DriverCommandRequest): void {
+        if (request.type === "command:dom:upsert-floating-element") this.floating.add(request.req.domId);
+        if (request.type === "command:dom:remove-floating-element") this.floating.delete(request.req.domId);
+    }
+
+    /**
+     * A preview's id comes with Drawdy's answer, even one that arrives after the command timed out, and it counts as
+     * gone only once Drawdy confirms the delete. One answered after stop began is past the teardown, so it goes at
+     * once.
+     */
+    private noteDone(request: DriverCommandRequest, value: unknown): void {
+        if (request.type === "command:scene:create-drawdy-preview-elements") {
+            const { previewId } = value as { previewId: string };
+            if (this.stopping) void this.deletePreviews([previewId]);
+            else this.previews.add(previewId);
+        }
+        if (request.type === "command:scene:delete-drawdy-preview-elements")
+            for (const previewId of request.req.previewIds) this.previews.delete(previewId);
     }
 
     private async report(type: CommandType, failure: CommandFailure): Promise<void> {
@@ -154,9 +223,13 @@ export class Host {
         if (!shown.ok) return;
         this.shownHint = key;
         if (this.hintTimer) clearTimeout(this.hintTimer);
-        this.hintTimer = setTimeout(() => {
-            this.shownHint = null;
-            void this.call("command:dom:remove-floating-element", { domId: HINT_ID });
-        }, HINT_MS);
+        this.hintTimer = setTimeout(() => this.removeHint(), HINT_MS);
+    }
+
+    private removeHint(): void {
+        if (this.hintTimer) clearTimeout(this.hintTimer);
+        this.hintTimer = null;
+        this.shownHint = null;
+        void this.call("command:dom:remove-floating-element", { domId: HINT_ID });
     }
 }
