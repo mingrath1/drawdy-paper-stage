@@ -27,6 +27,26 @@ function fakeDrawdy(answer: (request: DriverCommandRequest) => Answer, delayMs =
 
 const types = (requests: DriverCommandRequest[]) => requests.map((request) => request.type);
 
+/** Drawdy answers each create-preview only when the test says so, and everything else at once. */
+function deferredPreviews() {
+    const requests: DriverCommandRequest[] = [];
+    const answer: (() => void)[] = [];
+    const issue = ((request: DriverCommandRequest) => {
+        requests.push(request);
+        if (request.type !== "command:scene:create-drawdy-preview-elements")
+            return Promise.resolve({ ...request, res: { value: {} } });
+        const previewId = `pv${answer.length + 1}`;
+        return new Promise((resolve) =>
+            answer.push(() => resolve({ ...request, res: { value: { previewed: 1, previewId } } })),
+        );
+    }) as unknown as DriverCommandIssuer;
+    const deleted = () =>
+        requests.flatMap((request) =>
+            request.type === "command:scene:delete-drawdy-preview-elements" ? request.req.previewIds : [],
+        );
+    return { issue, answer, deleted };
+}
+
 describe("Host", () => {
     beforeEach(() => vi.useFakeTimers());
     afterEach(() => vi.useRealTimers());
@@ -155,6 +175,37 @@ describe("Host", () => {
         await host.stop();
         await host.call("command:dom:window-size");
         expect(drawdy.requests).toHaveLength(before + 2);
+    });
+
+    it("deletes a preview whose create Drawdy answers after it stopped", async () => {
+        const drawdy = deferredPreviews();
+        const host = new Host(drawdy.issue, "d", styling);
+        await host.call("command:scene:get-drawdy-elements", { properties: [] });
+        const created = host.call("command:scene:create-drawdy-preview-elements", { elements: [] });
+        await vi.advanceTimersByTimeAsync(0);
+        await host.stop();
+        expect(drawdy.deleted()).toEqual([]);
+        drawdy.answer[0]();
+        await expect(created).resolves.toMatchObject({ ok: false, error: "stopped" });
+        expect(drawdy.deleted()).toEqual(["pv1"]);
+    });
+
+    it("deletes a preview whose create Drawdy answers after it timed out, once the host stops", async () => {
+        const drawdy = deferredPreviews();
+        const host = new Host(drawdy.issue, "d", styling);
+        await host.call("command:scene:get-drawdy-elements", { properties: [] });
+        const before = host.call("command:scene:create-drawdy-preview-elements", { elements: [] });
+        const after = host.call("command:scene:create-drawdy-preview-elements", { elements: [] });
+        await vi.advanceTimersByTimeAsync(COMMAND_TIMEOUT_MS);
+        await expect(before).resolves.toMatchObject({ ok: false, error: "timeout" });
+        drawdy.answer[0]();
+        await vi.advanceTimersByTimeAsync(0);
+        await host.stop();
+        expect(drawdy.deleted()).toEqual(["pv1"]);
+        drawdy.answer[1]();
+        await vi.advanceTimersByTimeAsync(0);
+        await after;
+        expect(drawdy.deleted()).toEqual(["pv1", "pv2"]);
     });
 
     it("sends nothing until the previous instance has finished stopping", async () => {

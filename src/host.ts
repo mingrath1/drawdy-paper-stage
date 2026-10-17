@@ -96,7 +96,8 @@ export class Host {
 
     /**
      * Closes the door at once, then takes down what this host put on the screen. Those are the last commands it
-     * sends. Every later stop returns the same promise.
+     * sends, apart from deleting a preview whose create Drawdy answers later. Every later stop returns the same
+     * promise.
      */
     stop(): Promise<void> {
         return (this.stopping ??= this.takeDown());
@@ -106,8 +107,11 @@ export class Host {
         if (this.hintTimer) clearTimeout(this.hintTimer);
         await this.previousStopped;
         for (const domId of [...this.floating]) await this.send("command:dom:remove-floating-element", { domId });
-        if (this.previews.size > 0)
-            await this.send("command:scene:delete-drawdy-preview-elements", { previewIds: [...this.previews] });
+        await this.deletePreviews([...this.previews]);
+    }
+
+    private async deletePreviews(previewIds: string[]): Promise<void> {
+        if (previewIds.length > 0) await this.send("command:scene:delete-drawdy-preview-elements", { previewIds });
     }
 
     private async send<T extends CommandType>(type: T, ...[req]: RequestArgs<T>): Promise<CommandResult<T>> {
@@ -124,8 +128,13 @@ export class Host {
             timer = setTimeout(() => resolve("timeout"), limitMs);
         });
         this.noteIssued(request);
+        const answered = this.issueCommand(request).then((response) => {
+            const res = response.res as { value?: unknown; error?: unknown };
+            if (!res.error) this.noteDone(request, res.value);
+            return response;
+        });
         try {
-            const response = await Promise.race([this.issueCommand(request), timeout]);
+            const response = await Promise.race([answered, timeout]);
             if (response === "timeout") {
                 return {
                     ok: false,
@@ -136,7 +145,6 @@ export class Host {
             if (permission) this.decided.add(permission);
             const res = response.res as { value?: ValueOf<T>; error?: ProtocolCommandError };
             if (res.error) return { ok: false, error: res.error.type, message: res.error.message ?? res.error.type };
-            this.noteDone(request, res.value);
             return { ok: true, value: res.value as ValueOf<T> };
         } catch (err) {
             return { ok: false, error: "runtime", message: err instanceof Error ? err.message : String(err) };
@@ -151,10 +159,17 @@ export class Host {
         if (request.type === "command:dom:remove-floating-element") this.floating.delete(request.req.domId);
     }
 
-    /** A preview's id comes with Drawdy's answer, and it counts as gone only once Drawdy confirms the delete. */
+    /**
+     * A preview's id comes with Drawdy's answer, even one that arrives after the command timed out, and it counts as
+     * gone only once Drawdy confirms the delete. One answered after stop began is past the teardown, so it goes at
+     * once.
+     */
     private noteDone(request: DriverCommandRequest, value: unknown): void {
-        if (request.type === "command:scene:create-drawdy-preview-elements")
-            this.previews.add((value as { previewId: string }).previewId);
+        if (request.type === "command:scene:create-drawdy-preview-elements") {
+            const { previewId } = value as { previewId: string };
+            if (this.stopping) void this.deletePreviews([previewId]);
+            else this.previews.add(previewId);
+        }
         if (request.type === "command:scene:delete-drawdy-preview-elements")
             for (const previewId of request.req.previewIds) this.previews.delete(previewId);
     }
