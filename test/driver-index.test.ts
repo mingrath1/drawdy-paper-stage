@@ -23,6 +23,7 @@ class FakeSocket {
     static OPEN = 1;
     static all: FakeSocket[] = [];
     readyState = 0;
+    closedWith: number | undefined;
     sent: ClientMessage[] = [];
     onopen: (() => void) | null = null;
     onmessage: ((event: { data: string }) => void) | null = null;
@@ -33,8 +34,9 @@ class FakeSocket {
     send(data: string) {
         this.sent.push(JSON.parse(data) as ClientMessage);
     }
-    close() {
+    close(code?: number) {
         this.readyState = 3;
+        this.closedWith = code;
     }
     open() {
         this.readyState = 1;
@@ -399,7 +401,7 @@ describe("the driver against a fake Drawdy", () => {
         const heardFromOld = old.socket.sent.length;
 
         const reloaded = await startDriver(fake);
-        expect(old.socket.readyState).toBe(3);
+        expect(old.socket).toMatchObject({ readyState: 3, closedWith: 1000 });
         reloaded.moveElement(doodle("d", 300, 200));
         await vi.advanceTimersByTimeAsync(60_000);
 
