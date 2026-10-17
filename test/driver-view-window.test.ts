@@ -10,14 +10,14 @@ function texts(schema: DomElementSchema): string[] {
 }
 
 describe("viewLayout", () => {
-    it("docks the view at the left, below the toolbar, at 44% of the window's width", () => {
+    it("docks the view beside Drawdy's selection panel, below the toolbar, at 44% of the window's width", () => {
         expect(viewLayout({ width: 1200, height: 1289 }, "docked")).toEqual({
-            position: { x: 16, y: 64 },
+            position: { x: 209, y: 64 },
             width: 528,
             height: 1161,
         });
         expect(viewLayout({ width: 1600, height: 900 }, "docked")).toEqual({
-            position: { x: 16, y: 64 },
+            position: { x: 209, y: 64 },
             width: 704,
             height: 772,
         });
@@ -30,7 +30,7 @@ describe("viewLayout", () => {
 
     it("keeps a docked view inside a window narrower than its minimum width", () => {
         const layout = viewLayout({ width: 400, height: 300 }, "docked");
-        expect(layout.position.x + layout.width).toBeLessThanOrEqual(400 - 16);
+        expect(layout.position.x + layout.width).toBe(400 - 16);
         expect(layout.height).toBe(240);
     });
 

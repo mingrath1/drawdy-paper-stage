@@ -11,7 +11,8 @@ export type ViewMode = "docked" | "large";
 export type ViewLayout = { position: { x: number; y: number }; width: number; height: number };
 type WindowSize = { width: number; height: number };
 
-const DOCK = { top: 64, bottom: 64, side: 16, share: 0.44, minWidth: 420, maxWidth: 900, minHeight: 240 };
+// Drawdy's selection panel spans x 12 to 193, as measured on the board, and the dock sits clear of it.
+const DOCK = { left: 209, top: 64, bottom: 64, side: 16, share: 0.44, minWidth: 420, maxWidth: 900, minHeight: 240 };
 const LARGE_SHARE = 0.8;
 
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
@@ -19,9 +20,12 @@ const clamp = (value: number, min: number, max: number) => Math.min(Math.max(val
 const LAYOUTS: Record<ViewMode, (window: WindowSize) => ViewLayout> = {
     // The top margin clears Drawdy's toolbar and the bottom one its zoom bar.
     docked: (window) => ({
-        position: { x: DOCK.side, y: DOCK.top },
+        position: { x: DOCK.left, y: DOCK.top },
         width: Math.round(
-            clamp(window.width * DOCK.share, Math.min(DOCK.minWidth, window.width - 2 * DOCK.side), DOCK.maxWidth),
+            Math.min(
+                clamp(window.width * DOCK.share, DOCK.minWidth, DOCK.maxWidth),
+                window.width - DOCK.left - DOCK.side,
+            ),
         ),
         height: Math.max(window.height - DOCK.top - DOCK.bottom, DOCK.minHeight),
     }),

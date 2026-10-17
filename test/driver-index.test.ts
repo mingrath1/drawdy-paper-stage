@@ -561,7 +561,7 @@ describe("the driver against a fake Drawdy", () => {
         await vi.advanceTimersByTimeAsync(500);
         const [opened, refit] = views();
         expect(views()).toHaveLength(2);
-        expect(refit.req.position).toEqual({ x: 16, y: 64 });
+        expect(refit.req.position).toEqual({ x: 209, y: 64 });
         expect(refit.req.schema.styles).toMatchObject({ width: [572, "px"], height: [772, "px"] });
         expect(findIframe(refit.req.schema)).toEqual(findIframe(opened.req.schema));
     });
@@ -574,7 +574,7 @@ describe("the driver against a fake Drawdy", () => {
         const view = () => fake.floating.get("paper-stage-view")!;
         const clickResize = { type: "subscription:dom:element-clicked", body: { domElementId: "paper-stage-resize" } };
         const docked = view();
-        expect(docked.position).toEqual({ x: 16, y: 64 });
+        expect(docked.position).toEqual({ x: 209, y: 64 });
 
         await emit(clickResize);
         await vi.advanceTimersByTimeAsync(0);
@@ -596,6 +596,6 @@ describe("the driver against a fake Drawdy", () => {
 
         await emit(clickResize);
         await vi.advanceTimersByTimeAsync(0);
-        expect(view().position).toEqual({ x: 16, y: 64 });
+        expect(view().position).toEqual({ x: 209, y: 64 });
     });
 });
