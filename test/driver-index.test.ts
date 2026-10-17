@@ -1,6 +1,7 @@
 import type {
     CollaborationUserPresence,
     DomElementSchema,
+    DriverCommand,
     DriverCommandIssuer,
     DriverCommandRequest,
     DriverManifest,
@@ -12,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClientMessage, Rect, ServerMessage } from "../shared/protocol";
 import { captureArea, exportBounds, turnedBox } from "../src/cutouts";
 import { rectOf } from "../src/stage-model";
+import { viewLayout } from "../src/view-window";
 
 // The parser is the backend owner's half of the protocol; these tests drive the driver with well-formed frames.
 vi.mock("../shared/protocol", async (original) => ({
@@ -23,6 +25,7 @@ class FakeSocket {
     static OPEN = 1;
     static all: FakeSocket[] = [];
     readyState = 0;
+    closedWith: number | undefined;
     sent: ClientMessage[] = [];
     onopen: (() => void) | null = null;
     onmessage: ((event: { data: string }) => void) | null = null;
@@ -33,8 +36,9 @@ class FakeSocket {
     send(data: string) {
         this.sent.push(JSON.parse(data) as ClientMessage);
     }
-    close() {
+    close(code?: number) {
         this.readyState = 3;
+        this.closedWith = code;
     }
     open() {
         this.readyState = 1;
@@ -99,6 +103,7 @@ function doodle(id: string, x: number, y: number): SubscribedDrawdyElement {
 }
 
 type Answer = { value?: unknown; error?: { type: string; message: string } };
+type FloatingElement = Extract<DriverCommand, { type: "command:dom:upsert-floating-element" }>["req"];
 
 class FakeDrawdy {
     readonly elements = new Map<string, SubscribedDrawdyElement>();
@@ -107,6 +112,11 @@ class FakeDrawdy {
         { id: "me", name: "Ming", color: "#7c3aed", isHost: true, isSelf: true, cursorPosition: null },
     ];
     window = { width: 1000, height: 800 };
+    /** What the person sees: floating elements by domId and preview ids, as Drawdy applied the commands. */
+    readonly floating = new Map<string, FloatingElement>();
+    readonly previews = new Set<string>();
+    /** How long Drawdy takes to answer a command it has already applied, such as one behind a permission prompt. */
+    delay: (request: DriverCommandRequest) => number = () => 0;
     failCaptures = 0;
     /** Runs while Drawdy works on a capture, before it answers. */
     duringCapture: () => void = () => {};
@@ -117,7 +127,10 @@ class FakeDrawdy {
 
     readonly issue = (async (request: DriverCommandRequest) => {
         this.requests.push(request);
-        return { ...request, res: this.answer(request) };
+        const response = { ...request, res: this.answer(request) };
+        const ms = this.delay(request);
+        if (ms > 0) await new Promise((resolve) => setTimeout(resolve, ms));
+        return response;
     }) as unknown as DriverCommandIssuer;
 
     sent<T extends DriverCommandRequest["type"]>(type: T) {
@@ -131,9 +144,28 @@ class FakeDrawdy {
             case "command:collaboration:get-all-users-in-board":
                 return { value: { users: this.users } };
             case "command:dom:window-size":
-                return { value: this.window };
-            case "command:scene:create-drawdy-preview-elements":
-                return { value: { previewed: request.req.elements.length, previewId: `pv${this.requests.length}` } };
+                return { value: { ...this.window } };
+            case "command:camera:get-viewport-rect":
+                return { value: { rect: { x: 0, y: 0, ...this.window } } };
+            case "command:scene:add-drawdy-elements":
+                for (const schema of request.req.elements) {
+                    const element = { ...schema, id: schema.drawdyElementId } as unknown as SubscribedDrawdyElement;
+                    this.elements.set(element.id, element);
+                }
+                return { value: {} };
+            case "command:dom:upsert-floating-element":
+                this.floating.set(request.req.domId, request.req);
+                return { value: { created: true } };
+            case "command:dom:remove-floating-element":
+                return { value: { removed: this.floating.delete(request.req.domId) } };
+            case "command:scene:create-drawdy-preview-elements": {
+                const previewId = `pv${this.requests.length}`;
+                this.previews.add(previewId);
+                return { value: { previewed: request.req.elements.length, previewId } };
+            }
+            case "command:scene:delete-drawdy-preview-elements":
+                for (const previewId of request.req.previewIds) this.previews.delete(previewId);
+                return { value: { deleted: request.req.previewIds.length } };
             case "command:scene:capture-screenshot": {
                 this.duringCapture();
                 if (this.failCaptures > 0) {
@@ -157,25 +189,49 @@ class FakeDrawdy {
 
 const styling = { foreground: "#111111", surface: "#ffffff", border: "#dddddd" } as ModuleStyling;
 
-async function startDriver(fake: FakeDrawdy) {
+const clickButton = { type: "subscription:dom:element-clicked", body: { domElementId: "paper-stage-button" } };
+
+/** Loads the driver's bundle afresh into this worker, as Drawdy does on every reload, with its own log of requests. */
+async function loadDriver(fake: FakeDrawdy) {
     vi.resetModules();
     const driver = await import("../src/index");
+    const requests: DriverCommandRequest[] = [];
     let ids = 0;
-    await driver.activate({
-        issueCommand: fake.issue,
+    const context = {
+        issueCommand: ((request: DriverCommandRequest) => {
+            requests.push(request);
+            return fake.issue(request);
+        }) as DriverCommandIssuer,
         manifest: { driverId: "mingrath.paper-stage" } as DriverManifest,
         styling,
         generateId: () => `g${++ids}`,
-    });
-    const emit = (event: unknown) => driver.onEvent(event as DriverSubscriptionEvent);
-    await emit({ type: "subscription:dom:element-clicked", body: { domElementId: "paper-stage-button" } });
+    };
+    return {
+        requests,
+        activate: () => driver.activate(context),
+        emit: (event: unknown) => driver.onEvent(event as DriverSubscriptionEvent),
+    };
+}
+
+async function activateDriver(fake: FakeDrawdy) {
+    const driver = await loadDriver(fake);
+    await driver.activate();
+    return driver;
+}
+
+async function startDriver(fake: FakeDrawdy) {
+    const { emit, requests } = await activateDriver(fake);
+    await emit(clickButton);
     const socket = FakeSocket.all.at(-1)!;
     socket.open();
+    // Like the stage server, a driver whose socket is still open keeps the writer's seat.
+    const connectionIdOf = (s: FakeSocket) => `c${FakeSocket.all.indexOf(s) + 1}`;
+    const seated = FakeSocket.all.find((other) => other !== socket && other.readyState === FakeSocket.OPEN);
     socket.receive({
         type: "welcome",
         v: 2,
-        connectionId: "c1",
-        writer: { connectionId: "c1", epoch: 1 },
+        connectionId: connectionIdOf(socket),
+        writer: { connectionId: connectionIdOf(seated ?? socket), epoch: FakeSocket.all.length },
         snapshot: { revision: 0, frame: rectOf(frame)!, items: [] },
         walkers: [],
     });
@@ -183,7 +239,7 @@ async function startDriver(fake: FakeDrawdy) {
         fake.elements.set(element.id, element);
         void emit({ type: "subscription:scene:elements-updated", body: { drawdyElements: [element], properties: [] } });
     };
-    return { socket, emit, moveElement };
+    return { socket, emit, moveElement, requests };
 }
 
 const writes = (socket: FakeSocket) =>
@@ -383,10 +439,111 @@ describe("the driver against a fake Drawdy", () => {
         await vi.advanceTimersByTimeAsync(3_000);
         expect(fake.sent("command:scene:update-drawdy-elements")).toEqual([]);
         const [created] = fake.sent("command:scene:create-drawdy-preview-elements");
-        expect(created.req.elements).toContainEqual(expect.objectContaining({ type: "text", text: "Ming" }));
+        expect(created.req.elements).toContainEqual(expect.objectContaining({ type: "text", text: "You" }));
         socket.receive({ type: "walker.left", connectionId: "v1" });
         await vi.advanceTimersByTimeAsync(1_000);
         expect(fake.sent("command:scene:delete-drawdy-preview-elements")).toHaveLength(1);
+    });
+
+    it("hands the stage to a driver reloaded into the same worker, and the old one goes quiet", async () => {
+        const fake = new FakeDrawdy([frame, doodle("d", 100, 100)]);
+        const old = await startDriver(fake);
+        await vi.advanceTimersByTimeAsync(500);
+        const heardFromOld = old.socket.sent.length;
+
+        const reloaded = await startDriver(fake);
+        expect(old.socket).toMatchObject({ readyState: 3, closedWith: 1000 });
+        reloaded.moveElement(doodle("d", 300, 200));
+        await vi.advanceTimersByTimeAsync(60_000);
+
+        expect(old.socket.sent).toHaveLength(heardFromOld);
+        expect(FakeSocket.all).toHaveLength(2);
+        expect(writes(reloaded.socket).at(-1)).toMatchObject({
+            type: "scene.commit",
+            upserts: [{ id: "d", rect: captureArea(rectOf(doodle("d", 300, 200))!, 0) }],
+        });
+    });
+
+    it("takes the old driver's view and walker markers down when it reloads", async () => {
+        const fake = new FakeDrawdy([frame]);
+        const old = await startDriver(fake);
+        old.socket.receive({
+            type: "walker",
+            walker: {
+                connectionId: "v1",
+                participant: { presenceId: "p", name: "Ploy", color: "#0ca678" },
+                pose: { x: 300, y: 200, heading: 0, pitch: 0 },
+            },
+        });
+        await vi.advanceTimersByTimeAsync(100);
+        expect([...fake.floating.keys()]).toEqual(["paper-stage-view"]);
+        expect(fake.previews.size).toBe(1);
+
+        await activateDriver(fake);
+        expect(fake.floating.size).toBe(0);
+        expect(fake.previews.size).toBe(0);
+    });
+
+    it("keeps the reloaded driver's view when the old driver was still opening its own", async () => {
+        const fake = new FakeDrawdy([frame]);
+        const old = await startDriver(fake);
+        await vi.advanceTimersByTimeAsync(0);
+        await old.emit(clickButton);
+        await vi.advanceTimersByTimeAsync(0);
+        fake.delay = (request) => (request.type === "command:dom:window-size" ? 5_000 : 0);
+        await old.emit(clickButton);
+        await vi.advanceTimersByTimeAsync(0);
+        fake.delay = () => 0;
+        fake.window = { width: 1400, height: 900 };
+
+        await startDriver(fake);
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(fake.floating.get("paper-stage-view")?.position).toEqual(viewLayout(fake.window, "docked").position);
+    });
+
+    it("leaves the stage to the reloaded driver when the reload came while the permission prompt was open", async () => {
+        const fake = new FakeDrawdy([]);
+        const allowedAt = Date.now() + 60_000;
+        fake.delay = (request) =>
+            request.type.startsWith("subscription:scene:") ? Math.max(0, allowedAt - Date.now()) : 0;
+        const old = await activateDriver(fake);
+        void old.emit(clickButton);
+        await vi.advanceTimersByTimeAsync(1_000);
+
+        const reloaded = await activateDriver(fake);
+        const heardFromOld = old.requests.length;
+        void reloaded.emit(clickButton);
+        await vi.advanceTimersByTimeAsync(120_000);
+
+        expect(old.requests.slice(heardFromOld)).toEqual([]);
+        expect(fake.sent("command:scene:add-drawdy-elements")).toHaveLength(1);
+        expect(fake.sent("command:camera:fly-to-rect")).toHaveLength(1);
+    });
+
+    it("lets only the newer of two overlapping activations set up the button", async () => {
+        const fake = new FakeDrawdy([frame]);
+        fake.delay = (request) => (request.type === "command:dom:create-action-button" ? 1_000 : 0);
+        const first = await loadDriver(fake);
+        const activating = first.activate();
+        await vi.advanceTimersByTimeAsync(0);
+        fake.delay = () => 0;
+
+        await activateDriver(fake);
+        const heardFromFirst = first.requests.length;
+        await vi.advanceTimersByTimeAsync(5_000);
+        await activating;
+
+        expect(first.requests.slice(heardFromFirst)).toEqual([]);
+        expect(fake.sent("subscription:dom:element-clicked")).toHaveLength(1);
+    });
+
+    it("still answers its button after Drawdy activates the same bundle twice", async () => {
+        const fake = new FakeDrawdy([frame]);
+        const driver = await loadDriver(fake);
+        await driver.activate();
+        await driver.activate();
+        await driver.emit(clickButton);
+        expect(FakeSocket.all).toHaveLength(1);
     });
 
     it("refits the open view to a resized window once resizing settles, keeping the same page", async () => {
@@ -404,8 +561,41 @@ describe("the driver against a fake Drawdy", () => {
         await vi.advanceTimersByTimeAsync(500);
         const [opened, refit] = views();
         expect(views()).toHaveLength(2);
-        expect(refit.req.position).toEqual({ x: 130, y: 90 });
-        expect(refit.req.schema.styles).toMatchObject({ width: [1040, "px"], height: [720, "px"] });
+        expect(refit.req.position).toEqual({ x: 209, y: 64 });
+        expect(refit.req.schema.styles).toMatchObject({ width: [572, "px"], height: [772, "px"] });
         expect(findIframe(refit.req.schema)).toEqual(findIframe(opened.req.schema));
+    });
+
+    it("switches the open view between docked and large, and remembers the choice when it reopens", async () => {
+        const fake = new FakeDrawdy([frame]);
+        fake.window = { width: 1300, height: 900 };
+        const { emit } = await startDriver(fake);
+        await vi.advanceTimersByTimeAsync(0);
+        const view = () => fake.floating.get("paper-stage-view")!;
+        const clickResize = { type: "subscription:dom:element-clicked", body: { domElementId: "paper-stage-resize" } };
+        const docked = view();
+        expect(docked.position).toEqual({ x: 209, y: 64 });
+
+        await emit(clickResize);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(view().position).toEqual({ x: 130, y: 90 });
+        expect(view().schema.styles).toMatchObject({ width: [1040, "px"], height: [720, "px"] });
+        expect(findIframe(view().schema)).toEqual(findIframe(docked.schema));
+
+        await emit({ type: "subscription:dom:screen-resized", body: { width: 1000, height: 800 } });
+        await vi.advanceTimersByTimeAsync(500);
+        expect(view().position).toEqual({ x: 100, y: 80 });
+
+        await emit({ type: "subscription:dom:element-clicked", body: { domElementId: "paper-stage-close" } });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(fake.floating.has("paper-stage-view")).toBe(false);
+        fake.window = { width: 1300, height: 900 };
+        await emit(clickButton);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(view().position).toEqual({ x: 130, y: 90 });
+
+        await emit(clickResize);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(view().position).toEqual({ x: 209, y: 64 });
     });
 });
