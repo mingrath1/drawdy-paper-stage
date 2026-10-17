@@ -439,7 +439,7 @@ describe("the driver against a fake Drawdy", () => {
         await vi.advanceTimersByTimeAsync(3_000);
         expect(fake.sent("command:scene:update-drawdy-elements")).toEqual([]);
         const [created] = fake.sent("command:scene:create-drawdy-preview-elements");
-        expect(created.req.elements).toContainEqual(expect.objectContaining({ type: "text", text: "Ming" }));
+        expect(created.req.elements).toContainEqual(expect.objectContaining({ type: "text", text: "You" }));
         socket.receive({ type: "walker.left", connectionId: "v1" });
         await vi.advanceTimersByTimeAsync(1_000);
         expect(fake.sent("command:scene:delete-drawdy-preview-elements")).toHaveLength(1);
@@ -498,7 +498,7 @@ describe("the driver against a fake Drawdy", () => {
 
         await startDriver(fake);
         await vi.advanceTimersByTimeAsync(10_000);
-        expect(fake.floating.get("paper-stage-view")?.position).toEqual(viewLayout(fake.window).position);
+        expect(fake.floating.get("paper-stage-view")?.position).toEqual(viewLayout(fake.window, "docked").position);
     });
 
     it("leaves the stage to the reloaded driver when the reload came while the permission prompt was open", async () => {
@@ -561,8 +561,58 @@ describe("the driver against a fake Drawdy", () => {
         await vi.advanceTimersByTimeAsync(500);
         const [opened, refit] = views();
         expect(views()).toHaveLength(2);
-        expect(refit.req.position).toEqual({ x: 130, y: 90 });
-        expect(refit.req.schema.styles).toMatchObject({ width: [1040, "px"], height: [720, "px"] });
+        expect(refit.req.position).toEqual({ x: 209, y: 64 });
+        expect(refit.req.schema.styles).toMatchObject({ width: [572, "px"], height: [772, "px"] });
         expect(findIframe(refit.req.schema)).toEqual(findIframe(opened.req.schema));
+    });
+
+    it("switches the open view between docked and large, and remembers the choice when it reopens", async () => {
+        const fake = new FakeDrawdy([frame]);
+        fake.window = { width: 1300, height: 900 };
+        const { emit } = await startDriver(fake);
+        await vi.advanceTimersByTimeAsync(0);
+        const view = () => fake.floating.get("paper-stage-view")!;
+        const clickResize = { type: "subscription:dom:element-clicked", body: { domElementId: "paper-stage-resize" } };
+        const docked = view();
+        expect(docked.position).toEqual({ x: 209, y: 64 });
+
+        await emit(clickResize);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(view().position).toEqual({ x: 130, y: 90 });
+        expect(view().schema.styles).toMatchObject({ width: [1040, "px"], height: [720, "px"] });
+        expect(findIframe(view().schema)).toEqual(findIframe(docked.schema));
+
+        await emit({ type: "subscription:dom:screen-resized", body: { width: 1000, height: 800 } });
+        await vi.advanceTimersByTimeAsync(500);
+        expect(view().position).toEqual({ x: 100, y: 80 });
+
+        await emit({ type: "subscription:dom:element-clicked", body: { domElementId: "paper-stage-close" } });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(fake.floating.has("paper-stage-view")).toBe(false);
+        fake.window = { width: 1300, height: 900 };
+        await emit(clickButton);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(view().position).toEqual({ x: 130, y: 90 });
+
+        await emit(clickResize);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(view().position).toEqual({ x: 209, y: 64 });
+    });
+
+    it("hides the toggle on a window too small for the dock, and keeps the docked choice for when it grows", async () => {
+        const fake = new FakeDrawdy([frame]);
+        fake.window = { width: 400, height: 300 };
+        const { emit } = await startDriver(fake);
+        await vi.advanceTimersByTimeAsync(0);
+        const view = () => fake.floating.get("paper-stage-view")!;
+        expect(JSON.stringify(view().schema)).not.toContain("Expand");
+
+        await emit({ type: "subscription:dom:element-clicked", body: { domElementId: "paper-stage-resize" } });
+        await vi.advanceTimersByTimeAsync(0);
+        fake.window = { width: 1300, height: 900 };
+        await emit({ type: "subscription:dom:screen-resized", body: { width: 1300, height: 900 } });
+        await vi.advanceTimersByTimeAsync(500);
+        expect(view().position).toEqual({ x: 209, y: 64 });
+        expect(JSON.stringify(view().schema)).toContain("Expand");
     });
 });

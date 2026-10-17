@@ -62,6 +62,17 @@ describe("WalkerMarkers", () => {
         ]);
     });
 
+    it("labels this person's own walker You and everyone else by name", async () => {
+        const mine = new WalkerMarkers(new Host(drawdy.issue, "d", {} as ModuleStyling), "#1e1e1e", Date.now, "p-me");
+        mine.show(walker("me", 100, 100, "Mingrath"));
+        mine.show(walker("v2", 300, 100, "Ploy"));
+        await vi.advanceTimersByTimeAsync(0);
+        const labels = drawdy
+            .of("command:scene:create-drawdy-preview-elements")
+            .map((request) => (request.req!.elements as Schema[]).find((element) => element.type === "text")!.text);
+        expect(labels).toEqual(["You", "Ploy"]);
+    });
+
     it("eases toward each new pose instead of jumping, then goes quiet once it arrives", async () => {
         markers.show(walker("v1", 0, 0));
         await vi.advanceTimersByTimeAsync(0);

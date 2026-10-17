@@ -52,6 +52,8 @@ export class WalkerMarkers {
         private readonly host: Host,
         private readonly ink: string,
         private readonly now: () => number = Date.now,
+        /** This person's own walker is labelled "You" on their own board; everyone else still sees their name. */
+        private readonly selfPresenceId?: string,
     ) {}
 
     show(walker: Walker): void {
@@ -201,7 +203,10 @@ export class WalkerMarkers {
                 x: x - LABEL_WIDTH / 2,
                 y: y + DOT / 2 + 4,
                 width: LABEL_WIDTH,
-                text: marker.participant.name.slice(0, LABEL_CHARS),
+                text:
+                    marker.participant.presenceId === this.selfPresenceId
+                        ? "You"
+                        : marker.participant.name.slice(0, LABEL_CHARS),
                 fontSize: LABEL_SIZE,
                 color: this.ink,
                 textAlign: "center",
