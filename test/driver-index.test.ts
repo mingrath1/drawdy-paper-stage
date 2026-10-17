@@ -171,11 +171,14 @@ async function startDriver(fake: FakeDrawdy) {
     await emit({ type: "subscription:dom:element-clicked", body: { domElementId: "paper-stage-button" } });
     const socket = FakeSocket.all.at(-1)!;
     socket.open();
+    // Like the stage server, a driver whose socket is still open keeps the writer's seat.
+    const connectionIdOf = (s: FakeSocket) => `c${FakeSocket.all.indexOf(s) + 1}`;
+    const seated = FakeSocket.all.find((other) => other !== socket && other.readyState === FakeSocket.OPEN);
     socket.receive({
         type: "welcome",
         v: 2,
-        connectionId: "c1",
-        writer: { connectionId: "c1", epoch: 1 },
+        connectionId: connectionIdOf(socket),
+        writer: { connectionId: connectionIdOf(seated ?? socket), epoch: FakeSocket.all.length },
         snapshot: { revision: 0, frame: rectOf(frame)!, items: [] },
         walkers: [],
     });
@@ -387,6 +390,25 @@ describe("the driver against a fake Drawdy", () => {
         socket.receive({ type: "walker.left", connectionId: "v1" });
         await vi.advanceTimersByTimeAsync(1_000);
         expect(fake.sent("command:scene:delete-drawdy-preview-elements")).toHaveLength(1);
+    });
+
+    it("hands the stage to a driver reloaded into the same worker, and the old one goes quiet", async () => {
+        const fake = new FakeDrawdy([frame, doodle("d", 100, 100)]);
+        const old = await startDriver(fake);
+        await vi.advanceTimersByTimeAsync(500);
+        const heardFromOld = old.socket.sent.length;
+
+        const reloaded = await startDriver(fake);
+        expect(old.socket.readyState).toBe(3);
+        reloaded.moveElement(doodle("d", 300, 200));
+        await vi.advanceTimersByTimeAsync(60_000);
+
+        expect(old.socket.sent).toHaveLength(heardFromOld);
+        expect(FakeSocket.all).toHaveLength(2);
+        expect(writes(reloaded.socket).at(-1)).toMatchObject({
+            type: "scene.commit",
+            upserts: [{ id: "d", rect: captureArea(rectOf(doodle("d", 300, 200))!, 0) }],
+        });
     });
 
     it("refits the open view to a resized window once resizing settles, keeping the same page", async () => {
