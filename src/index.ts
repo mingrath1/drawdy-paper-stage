@@ -31,7 +31,7 @@ import {
     type SceneState,
 } from "./stage-model";
 import { buildViewHtml } from "./view-html";
-import { CLOSE_ID, VIEW_ID, viewLayout, viewSchema } from "./view-window";
+import { CLOSE_ID, otherMode, RESIZE_ID, VIEW_ID, viewLayout, viewSchema, type ViewMode } from "./view-window";
 import { WalkerMarkers } from "./walkers";
 
 const BUTTON_ID = "paper-stage-button";
@@ -138,6 +138,8 @@ class Driver {
     private lastFlush = 0;
     private viewQueue = Promise.resolve();
     private resizeTimer: ReturnType<typeof setTimeout> | null = null;
+    /** Kept across closing and reopening the view. */
+    private viewMode: ViewMode = "docked";
 
     constructor(
         private readonly host: Host,
@@ -166,8 +168,9 @@ class Driver {
         switch (event.type) {
             case "subscription:dom:element-clicked":
                 if (event.body.domElementId === BUTTON_ID) return this.onButton();
-                if (event.body.domElementId === CLOSE_ID && this.state.phase === "running")
-                    return this.setViewWanted(this.state.stage, false);
+                if (this.state.phase !== "running") return;
+                if (event.body.domElementId === CLOSE_ID) return this.setViewWanted(this.state.stage, false);
+                if (event.body.domElementId === RESIZE_ID) return this.toggleViewMode(this.state.stage);
                 return;
             case "subscription:scene:elements-added":
             case "subscription:scene:elements-updated":
@@ -462,6 +465,15 @@ class Driver {
         }, RESIZE_SETTLE_MS);
     }
 
+    private toggleViewMode(stage: Stage): void {
+        this.viewMode = otherMode(this.viewMode);
+        this.queueView(async () => {
+            if (!stage.viewOpen) return;
+            const size = await this.host.run("command:dom:window-size");
+            if (size.ok) await this.placeView(stage, size.value);
+        });
+    }
+
     private async applyView(stage: Stage): Promise<void> {
         const current = this.state.phase === "running" && this.state.stage === stage;
         const show = current && stage.viewWanted && stage.relay.welcomed;
@@ -478,17 +490,21 @@ class Driver {
             return;
         }
         await this.subscribe("subscription:dom:element-clicked", { domElementId: CLOSE_ID });
+        await this.subscribe("subscription:dom:element-clicked", { domElementId: RESIZE_ID });
         await this.subscribe("subscription:dom:screen-resized");
     }
 
-    /** Shows the view sized to the window. The srcDoc is the same string every time; only size and position change. */
+    /**
+     * Shows the view in its mode, sized to the window. The srcDoc is the same string every time; only the size, the
+     * position, and the toggle's label change.
+     */
     private async placeView(stage: Stage, window: { width: number; height: number }): Promise<boolean> {
-        const layout = viewLayout(window);
+        const layout = viewLayout(window, this.viewMode);
         const placed = await this.host.run("command:dom:upsert-floating-element", {
             domId: VIEW_ID,
             position: layout.position,
             asPopover: false,
-            schema: viewSchema(stage.viewHtml, layout, this.host.palette),
+            schema: viewSchema(stage.viewHtml, this.viewMode, layout, this.host.palette),
         });
         return placed.ok;
     }
