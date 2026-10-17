@@ -208,6 +208,19 @@ describe("Host", () => {
         expect(drawdy.deleted()).toEqual(["pv1", "pv2"]);
     });
 
+    it("stops cleanly when Drawdy throws while it takes things down", async () => {
+        let broken = false;
+        const issue = ((request: DriverCommandRequest) => {
+            if (broken) throw new Error("transport gone");
+            return Promise.resolve({ ...request, res: { value: { previewed: 1, previewId: "pv1" } } });
+        }) as unknown as DriverCommandIssuer;
+        const host = new Host(issue, "d", styling);
+        await host.call("command:scene:create-drawdy-preview-elements", { elements: [] });
+        broken = true;
+        await expect(host.stop()).resolves.toBeUndefined();
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
     it("sends nothing until the previous instance has finished stopping", async () => {
         const drawdy = fakeDrawdy(() => ({ value: {} }));
         let finish = () => {};

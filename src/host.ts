@@ -128,12 +128,13 @@ export class Host {
             timer = setTimeout(() => resolve("timeout"), limitMs);
         });
         this.noteIssued(request);
-        const answered = this.issueCommand(request).then((response) => {
-            const res = response.res as { value?: unknown; error?: unknown };
-            if (!res.error) this.noteDone(request, res.value);
-            return response;
-        });
         try {
+            const answered = this.issueCommand(request).then((response) => {
+                const res = response.res as { value?: unknown; error?: unknown };
+                if (!res.error) this.noteDone(request, res.value);
+                return response;
+            });
+            answered.catch(() => undefined);
             const response = await Promise.race([answered, timeout]);
             if (response === "timeout") {
                 return {
