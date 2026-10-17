@@ -12,23 +12,25 @@ export type ViewLayout = { position: { x: number; y: number }; width: number; he
 type WindowSize = { width: number; height: number };
 
 // Drawdy's selection panel spans x 12 to 193, as measured on the board, and the dock sits clear of it.
-const DOCK = { left: 209, top: 64, bottom: 64, side: 16, share: 0.44, minWidth: 420, maxWidth: 900, minHeight: 240 };
+// Below fitWidth the title bar's buttons no longer fit, and below fitHeight the view is a sliver, so the dock gives way.
+const DOCK = { left: 209, top: 64, bottom: 64, side: 16, share: 0.44, minWidth: 420, maxWidth: 900, fitWidth: 280, fitHeight: 200 };
 const LARGE_SHARE = 0.8;
 
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 
 const LAYOUTS: Record<ViewMode, (window: WindowSize) => ViewLayout> = {
-    // The top margin clears Drawdy's toolbar and the bottom one its zoom bar.
-    docked: (window) => ({
-        position: { x: DOCK.left, y: DOCK.top },
-        width: Math.round(
-            Math.min(
-                clamp(window.width * DOCK.share, DOCK.minWidth, DOCK.maxWidth),
-                window.width - DOCK.left - DOCK.side,
-            ),
-        ),
-        height: Math.max(window.height - DOCK.top - DOCK.bottom, DOCK.minHeight),
-    }),
+    // The top margin clears Drawdy's toolbar and the bottom one its zoom bar. A window too small for the dock gets the
+    // large layout, which always fits.
+    docked: (window) => {
+        const roomWidth = window.width - DOCK.left - DOCK.side;
+        const roomHeight = window.height - DOCK.top - DOCK.bottom;
+        if (roomWidth < DOCK.fitWidth || roomHeight < DOCK.fitHeight) return LAYOUTS.large(window);
+        return {
+            position: { x: DOCK.left, y: DOCK.top },
+            width: Math.round(Math.min(clamp(window.width * DOCK.share, DOCK.minWidth, DOCK.maxWidth), roomWidth)),
+            height: roomHeight,
+        };
+    },
     large: (window) => {
         const width = Math.round(window.width * LARGE_SHARE);
         const height = Math.round(window.height * LARGE_SHARE);
@@ -78,7 +80,7 @@ export function viewSchema(srcDoc: string, mode: ViewMode, layout: ViewLayout, p
                 ],
                 { align: "between", width: px(layout.width), height: px(HEADER) },
             ),
-            iframe(srcDoc, layout.width, layout.height - HEADER),
+            iframe(srcDoc, layout.width, Math.max(0, layout.height - HEADER)),
         ],
         {
             width: px(layout.width),

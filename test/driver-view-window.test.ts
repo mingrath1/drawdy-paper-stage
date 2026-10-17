@@ -29,9 +29,34 @@ describe("viewLayout", () => {
     });
 
     it("keeps a docked view inside a window narrower than its minimum width", () => {
-        const layout = viewLayout({ width: 400, height: 300 }, "docked");
-        expect(layout.position.x + layout.width).toBe(400 - 16);
-        expect(layout.height).toBe(240);
+        const layout = viewLayout({ width: 600, height: 700 }, "docked");
+        expect(layout.position.x + layout.width).toBe(600 - 16);
+        expect(layout.height).toBe(700 - 128);
+    });
+
+    it("gives a window too small for the dock the large layout", () => {
+        expect(viewLayout({ width: 400, height: 300 }, "docked")).toEqual(viewLayout({ width: 400, height: 300 }, "large"));
+        expect(viewLayout({ width: 800, height: 250 }, "docked")).toEqual(viewLayout({ width: 800, height: 250 }, "large"));
+    });
+
+    it("fits every layout inside the window, from tiny to huge, with a view the iframe can fill", () => {
+        const sizes = [
+            [120, 90], [200, 160], [320, 240], [400, 300], [800, 250], [800, 600], [1024, 600], [1366, 768],
+            [1920, 1080], [3840, 2160],
+        ];
+        for (const [width, height] of sizes)
+            for (const mode of ["docked", "large"] as const) {
+                const { position, width: w, height: h } = viewLayout({ width, height }, mode);
+                const where = `${mode} at ${width}x${height}`;
+                expect(position.x, where).toBeGreaterThanOrEqual(0);
+                expect(position.y, where).toBeGreaterThanOrEqual(0);
+                expect(w, where).toBeGreaterThan(0);
+                expect(h, where).toBeGreaterThan(0);
+                expect(position.x + w, where).toBeLessThanOrEqual(width);
+                expect(position.y + h, where).toBeLessThanOrEqual(height);
+                const schema = JSON.stringify(viewSchema("<p>", mode, { position, width: w, height: h }, palette));
+                expect(schema, where).not.toMatch(/\[-\d/);
+            }
     });
 
     it("centers the large view over 80% of the window", () => {
