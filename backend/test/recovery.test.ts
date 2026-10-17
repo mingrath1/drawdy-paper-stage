@@ -6,15 +6,13 @@ import {
   configure,
   createRegistry,
   defineExtension,
-  type ConversationId,
+  defineTask,
   Harness,
   ROOT_CONVERSATION_ID,
-  type SubmissionRecord,
   type Storage,
 } from "@earendil-works/pi-durable";
 import { openDurableObjectSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/cloudflare";
 import { describe, expect, it } from "vitest";
-import { DeliverScheduledInstruction } from "../src/schedule.ts";
 
 const context = BACKGROUND_CONTEXT;
 
@@ -31,7 +29,31 @@ async function openFauxHarness(
   return Harness.open(storage, { models, registry: createRegistry() }, context);
 }
 
-describe("session recovery", () => {
+async function wake(stageId: string): Promise<void> {
+  const response = await exports.default.fetch(`https://example.com/api/stages/${stageId}`, {
+    headers: { Upgrade: "websocket" },
+  });
+  expect(response.status).toBe(101);
+  response.webSocket!.accept();
+  response.webSocket!.close(1000, "test setup complete");
+}
+
+/** A task the Stage has no definition for, so its scheduler reports it as blocked. */
+const UnknownTask = defineTask<null, { phase: "wait" }, null>({
+  name: "test.unknown-to-stage",
+  version: 1,
+  initial: () => ({ phase: "wait" }),
+  phases: {
+    wait: async (_task, runtime, context) => {
+      await runtime.sleep(Date.now() + 3_600_000, context);
+    },
+  },
+  abort: async (_task, runtime, context) => {
+    await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), context);
+  },
+});
+
+describe("stage recovery", () => {
   it("resumes an interrupted in-flight generation after eviction", async () => {
     const firstRequestStarted = Promise.withResolvers<void>();
     const interrupted: FauxResponseStep = async (_request, options) => {
@@ -43,8 +65,8 @@ describe("session recovery", () => {
       });
     };
 
-    const sessionId = "in-flight-recovery";
-    const stub = env.SESSIONS.getByName(sessionId);
+    const stageId = "in-flight-recovery";
+    const stub = env.STAGES.getByName(stageId);
     await runInDurableObject(stub, async (_instance, state) => {
       const storage = await openStorage(state);
       const harness = await openFauxHarness(storage, [interrupted]);
@@ -58,11 +80,7 @@ describe("session recovery", () => {
             }),
         });
         await root.submit(
-          {
-            type: "input",
-            content: "Finish after recovery",
-            requestId: "recovery-turn",
-          },
+          { type: "input", content: "Finish after recovery", requestId: "recovery-turn" },
           context,
         );
         await firstRequestStarted.promise;
@@ -71,15 +89,9 @@ describe("session recovery", () => {
       }
     });
     await evictDurableObject(stub);
+    await wake(stageId);
 
     let status: string | undefined;
-    const wake = await exports.default.fetch(`https://example.com/api/sessions/${sessionId}`, {
-      headers: { Upgrade: "websocket" },
-    });
-    expect(wake.status).toBe(101);
-    wake.webSocket!.accept();
-    wake.webSocket!.close(1000, "test setup complete");
-
     for (let attempt = 0; attempt < 100 && status === undefined; attempt++) {
       status = await runInDurableObject(stub, async (_instance, state) => {
         const submission = await (
@@ -92,12 +104,12 @@ describe("session recovery", () => {
     expect(status).toBe("unanswered");
   });
 
-  it("re-arms and submits a persisted scheduled instruction after eviction", async () => {
-    const sessionId = "scheduled-instruction-recovery";
-    const stub = env.SESSIONS.getByName(sessionId);
+  it("deletes the platform alarm when no stored task can run", async () => {
+    const stageId = "obsolete-platform-alarm";
+    const stub = env.STAGES.getByName(stageId);
     await runInDurableObject(stub, async (_instance, state) => {
       const registry = createRegistry();
-      registry.install(defineExtension({ name: "schedule", tasks: [DeliverScheduledInstruction] }));
+      registry.install(defineExtension({ name: "test", tasks: [UnknownTask] }));
       const harness = await Harness.open(
         await openStorage(state),
         { models: createModels(), registry },
@@ -106,100 +118,15 @@ describe("session recovery", () => {
       try {
         await harness.root(context, {
           init: (tx, conversationId) =>
-            configure(tx, conversationId, {
-              thinkingLevel: "off",
-              tools: [],
-            }),
+            configure(tx, conversationId, { thinkingLevel: "off", tools: [] }),
         });
         await harness.commit(
           (tx) =>
-            tx.createTask(
-              DeliverScheduledInstruction,
-              {
-                id: "schedule:integration",
-                conversationId: ROOT_CONVERSATION_ID,
-                instruction: "Check the oven",
-                runAt: Date.now() + 200,
-              },
-              {
-                ownership: { kind: "conversation" },
-                conversationId: ROOT_CONVERSATION_ID,
-                background: true,
-              },
-            ),
-          context,
-        );
-      } finally {
-        await harness.close(context);
-      }
-    });
-    await evictDurableObject(stub);
-
-    const reopened = await exports.default.fetch(`https://example.com/api/sessions/${sessionId}`, {
-      headers: { Upgrade: "websocket" },
-    });
-    expect(reopened.status).toBe(101);
-    reopened.webSocket!.accept();
-    reopened.webSocket!.close(1000, "test setup complete");
-    expect(await runInDurableObject(stub, (_instance, state) => state.storage.getAlarm())).not.toBe(
-      null,
-    );
-    await evictDurableObject(stub);
-    await new Promise((resolve) => setTimeout(resolve, 220));
-    await runDurableObjectAlarm(stub);
-
-    let submission: SubmissionRecord | undefined;
-    for (let attempt = 0; attempt < 100 && submission === undefined; attempt++) {
-      submission = await runInDurableObject(stub, async (_instance, state) =>
-        (await openStorage(state)).submissionByRequest(
-          ROOT_CONVERSATION_ID,
-          "schedule:integration",
-          context,
-        ),
-      );
-    }
-    expect(submission).toMatchObject({
-      conversationId: ROOT_CONVERSATION_ID,
-      requestId: "schedule:integration",
-      type: "input",
-    });
-  });
-
-  it("deletes the platform alarm when scheduled work is no longer actionable", async () => {
-    const sessionId = "obsolete-platform-alarm";
-    const stub = env.SESSIONS.getByName(sessionId);
-    await runInDurableObject(stub, async (_instance, state) => {
-      const registry = createRegistry();
-      registry.install(defineExtension({ name: "schedule", tasks: [DeliverScheduledInstruction] }));
-      const harness = await Harness.open(
-        await openStorage(state),
-        { models: createModels(), registry },
-        context,
-      );
-      try {
-        await harness.root(context, {
-          init: (tx, conversationId) =>
-            configure(tx, conversationId, {
-              thinkingLevel: "off",
-              tools: [],
+            tx.createTask(UnknownTask, null, {
+              ownership: { kind: "conversation" },
+              conversationId: ROOT_CONVERSATION_ID,
+              background: true,
             }),
-        });
-        await harness.commit(
-          (tx) =>
-            tx.createTask(
-              DeliverScheduledInstruction,
-              {
-                id: "schedule:missing-conversation",
-                conversationId: 999 as ConversationId,
-                instruction: "This cannot be delivered",
-                runAt: Date.now() - 1,
-              },
-              {
-                ownership: { kind: "conversation" },
-                conversationId: ROOT_CONVERSATION_ID,
-                background: true,
-              },
-            ),
           context,
         );
         await state.storage.setAlarm(Date.now());
