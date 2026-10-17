@@ -272,7 +272,7 @@ class Driver {
                             : ["This version of Paper Stage is out of date. Update the extension and try again."],
                     ),
             }),
-            walkers: new WalkerMarkers(this.host, this.host.palette.text),
+            walkers: new WalkerMarkers(this.host, this.host.palette.text, Date.now, participant.presenceId),
             cutouts: new CutoutCache(),
             sendCursors: throttle(1000 / CURSOR_HZ, (users: readonly CollaborationUserPresence[]) =>
                 stage.relay.sendCursors(cursorsOf(users)),

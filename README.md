@@ -13,7 +13,7 @@ Watch the [full demo video](assets/demo.mp4).
 1. **Open the stage.** Click the house button on the right edge of the board. The first time, click **Allow** on the permission prompt. A frame named "Paper Stage" appears with a starter two-room floor plan, and the 3D view opens docked at the left side of the window. The rest of the board stays in sight and you can keep drawing on it. Click **Expand** in the view's title bar for a large view, and **Dock** to put it back at the side.
 2. **Walk in.** Click inside the 3D view once so it hears the keyboard. Walk with WASD or the arrow keys, and drag to look around. Walls block you, so use the doorway.
 3. **Draw on the plan.** Draw a rectangle, circle, or diamond inside the frame, and it stands up as a wall. Draw a doodle, add a sticky note, type some text, or drop an image, and it stands up as a paper cutout that turns to face you.
-4. **Invite people in.** Everyone on the board who clicks the house button joins the same stage. While they walk, each one shows in the 3D view as a named paper figure and on the board as a named dot. The cursors of people on the board show in the 3D view as giant named hands.
+4. **Invite people in.** Everyone on the board who clicks the house button joins the same stage. While they walk, each one shows in the 3D view as a named paper figure and on the board as a named dot. Your own dot reads "You" on your board. The cursors of people on the board show in the 3D view as giant named hands.
 5. **Keep editing.** Drag a doodle or draw a new wall on the board, and the 3D view updates while you watch.
 
 | Interaction | What happens |

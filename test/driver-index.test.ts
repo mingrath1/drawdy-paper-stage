@@ -439,7 +439,7 @@ describe("the driver against a fake Drawdy", () => {
         await vi.advanceTimersByTimeAsync(3_000);
         expect(fake.sent("command:scene:update-drawdy-elements")).toEqual([]);
         const [created] = fake.sent("command:scene:create-drawdy-preview-elements");
-        expect(created.req.elements).toContainEqual(expect.objectContaining({ type: "text", text: "Ming" }));
+        expect(created.req.elements).toContainEqual(expect.objectContaining({ type: "text", text: "You" }));
         socket.receive({ type: "walker.left", connectionId: "v1" });
         await vi.advanceTimersByTimeAsync(1_000);
         expect(fake.sent("command:scene:delete-drawdy-preview-elements")).toHaveLength(1);
