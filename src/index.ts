@@ -31,7 +31,7 @@ import {
     type SceneState,
 } from "./stage-model";
 import { buildViewHtml } from "./view-html";
-import { CLOSE_ID, otherMode, RESIZE_ID, VIEW_ID, viewLayout, viewSchema, type ViewMode } from "./view-window";
+import { canToggle, CLOSE_ID, otherMode, RESIZE_ID, VIEW_ID, viewLayout, viewSchema, type ViewMode } from "./view-window";
 import { WalkerMarkers } from "./walkers";
 
 const BUTTON_ID = "paper-stage-button";
@@ -466,11 +466,12 @@ class Driver {
     }
 
     private toggleViewMode(stage: Stage): void {
-        this.viewMode = otherMode(this.viewMode);
         this.queueView(async () => {
             if (!stage.viewOpen) return;
             const size = await this.host.run("command:dom:window-size");
-            if (size.ok) await this.placeView(stage, size.value);
+            if (!size.ok || !canToggle(size.value)) return;
+            this.viewMode = otherMode(this.viewMode);
+            await this.placeView(stage, size.value);
         });
     }
 
@@ -504,7 +505,7 @@ class Driver {
             domId: VIEW_ID,
             position: layout.position,
             asPopover: false,
-            schema: viewSchema(stage.viewHtml, this.viewMode, layout, this.host.palette),
+            schema: viewSchema(stage.viewHtml, this.viewMode, layout, this.host.palette, canToggle(window)),
         });
         return placed.ok;
     }

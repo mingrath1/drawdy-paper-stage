@@ -598,4 +598,21 @@ describe("the driver against a fake Drawdy", () => {
         await vi.advanceTimersByTimeAsync(0);
         expect(view().position).toEqual({ x: 209, y: 64 });
     });
+
+    it("hides the toggle on a window too small for the dock, and keeps the docked choice for when it grows", async () => {
+        const fake = new FakeDrawdy([frame]);
+        fake.window = { width: 400, height: 300 };
+        const { emit } = await startDriver(fake);
+        await vi.advanceTimersByTimeAsync(0);
+        const view = () => fake.floating.get("paper-stage-view")!;
+        expect(JSON.stringify(view().schema)).not.toContain("Expand");
+
+        await emit({ type: "subscription:dom:element-clicked", body: { domElementId: "paper-stage-resize" } });
+        await vi.advanceTimersByTimeAsync(0);
+        fake.window = { width: 1300, height: 900 };
+        await emit({ type: "subscription:dom:screen-resized", body: { width: 1300, height: 900 } });
+        await vi.advanceTimersByTimeAsync(500);
+        expect(view().position).toEqual({ x: 209, y: 64 });
+        expect(JSON.stringify(view().schema)).toContain("Expand");
+    });
 });

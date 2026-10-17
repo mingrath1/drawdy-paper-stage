@@ -48,7 +48,18 @@ export function viewLayout(window: WindowSize, mode: ViewMode): ViewLayout {
 
 export const otherMode = (mode: ViewMode): ViewMode => (mode === "docked" ? "large" : "docked");
 
-export function viewSchema(srcDoc: string, mode: ViewMode, layout: ViewLayout, palette: Palette): DomElementSchema {
+/** A window too small for the dock gives both modes the same rect, so the toggle would change nothing there. */
+export function canToggle(window: WindowSize): boolean {
+    return JSON.stringify(viewLayout(window, "docked")) !== JSON.stringify(viewLayout(window, "large"));
+}
+
+export function viewSchema(
+    srcDoc: string,
+    mode: ViewMode,
+    layout: ViewLayout,
+    palette: Palette,
+    toggleable = true,
+): DomElementSchema {
     const box = (child: DomElementSchema): DomElementSchema => ({
         type: "box",
         children: [child],
@@ -69,7 +80,7 @@ export function viewSchema(srcDoc: string, mode: ViewMode, layout: ViewLayout, p
                     box(
                         row(
                             [
-                                headerButton(RESIZE_ID, mode === "docked" ? "Expand" : "Dock"),
+                                ...(toggleable ? [headerButton(RESIZE_ID, mode === "docked" ? "Expand" : "Dock")] : []),
                                 headerButton(CLOSE_ID, "Close"),
                             ],
                             {
