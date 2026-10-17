@@ -154,9 +154,18 @@ export class Host {
         if (!shown.ok) return;
         this.shownHint = key;
         if (this.hintTimer) clearTimeout(this.hintTimer);
-        this.hintTimer = setTimeout(() => {
-            this.shownHint = null;
-            void this.call("command:dom:remove-floating-element", { domId: HINT_ID });
-        }, HINT_MS);
+        this.hintTimer = setTimeout(() => this.removeHint(), HINT_MS);
+    }
+
+    /** Takes down a shown hint now, so no timer of this host outlives it. */
+    stop(): void {
+        if (this.hintTimer) this.removeHint();
+    }
+
+    private removeHint(): void {
+        if (this.hintTimer) clearTimeout(this.hintTimer);
+        this.hintTimer = null;
+        this.shownHint = null;
+        void this.call("command:dom:remove-floating-element", { domId: HINT_ID });
     }
 }

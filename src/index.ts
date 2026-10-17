@@ -62,12 +62,22 @@ type Stage = {
 
 type DriverState = { phase: "idle" } | { phase: "starting" } | { phase: "running"; stage: Stage };
 
+/**
+ * Drawdy reloads a driver by loading the new bundle into the same worker, with no hook to stop the old one. Its relay
+ * would keep the writer's seat, so each instance registers here by driverId and the next one stops it.
+ */
+const LIVE_DRIVERS = Symbol.for("paper-stage.live-drivers");
+
 let host: Host;
 let generateId: () => string;
 let state: DriverState = { phase: "idle" };
+let disposed = false;
 const subscribed = new Set<string>();
 
 export const activate: DriverModule["activate"] = async (ctx) => {
+    const live = ((globalThis as { [LIVE_DRIVERS]?: Map<string, () => void> })[LIVE_DRIVERS] ??= new Map());
+    live.get(ctx.manifest.driverId)?.();
+    live.set(ctx.manifest.driverId, dispose);
     host = new Host(ctx.issueCommand, ctx.manifest.driverId, ctx.styling);
     generateId = ctx.generateId;
     // Only these two run before the first click: neither opens a permission prompt.
@@ -80,6 +90,7 @@ export const activate: DriverModule["activate"] = async (ctx) => {
 };
 
 export const onEvent: DriverModule["onEvent"] = async (event) => {
+    if (disposed) return;
     switch (event.type) {
         case "subscription:dom:element-clicked":
             if (event.body.domElementId === BUTTON_ID) return onButton();
@@ -120,7 +131,7 @@ async function onButton(): Promise<void> {
         console.error("[paper-stage] could not open the stage", err);
         return null;
     });
-    if (!stage) {
+    if (!stage || disposed) {
         state = { phase: "idle" };
         return;
     }
@@ -363,12 +374,25 @@ function noteDropped(stage: Stage, dropped: Partial<Stage["dropped"]>): void {
 
 function closeStage(stage: Stage): void {
     if (state.phase !== "running" || state.stage !== stage) return;
+    stopStage(stage);
+    void host.hint("The Paper Stage frame is gone", ["Click the Paper Stage button to build a new stage."]);
+}
+
+function stopStage(stage: Stage): void {
     state = { phase: "idle" };
     stage.relay.stop();
     void stage.walkers.stop();
     stage.viewWanted = false;
     syncView(stage);
-    void host.hint("The Paper Stage frame is gone", ["Click the Paper Stage button to build a new stage."]);
+}
+
+function dispose(): void {
+    disposed = true;
+    if (state.phase === "running") stopStage(state.stage);
+    state = { phase: "idle" };
+    if (flushTimer) clearTimeout(flushTimer);
+    if (resizeTimer) clearTimeout(resizeTimer);
+    host.stop();
 }
 
 function setViewWanted(stage: Stage, wanted: boolean): void {
