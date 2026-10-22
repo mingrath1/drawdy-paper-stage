@@ -2,11 +2,24 @@
 
 Paper Stage turns a floor plan drawn on your board into a 3D place you and your friends can walk through together.
 
+[![Install in Drawdy](https://img.shields.io/badge/Install%20in%20Drawdy-4f5bd5?style=for-the-badge)](https://drawdy.io/extensions/mingrath.paper-stage)
+
 Install the extension, click the house button, then click into the 3D view and walk with WASD.
 
 ![A floor plan drawn on a dark Drawdy board tips back and its walls grow out of the floor in the Paper Stage 3D view, then one click on the real board docks the view beside the plan.](assets/demo.gif)
 
 Watch the [full demo video](assets/demo.mp4) (47 s, with sound). Its 3D shots are drawn by Paper Stage's own view, and the teammates in it are test scripts.
+
+## Install
+
+Paper Stage is on the [Drawdy extension store](https://drawdy.io/extensions/mingrath.paper-stage). You need a Drawdy board.
+
+1. Open a board in Drawdy.
+2. Click **Extensions** in the toolbar.
+3. On the **Discover** tab, search for "Paper Stage", open it, and press **Install**.
+4. Click the house button on the right edge of the board. The first time, click **Allow** on the permission prompt.
+
+Then follow [How to use](#how-to-use). To walk the same stage together, everyone opens the same board and clicks the house button.
 
 ## How to use
 
@@ -69,3 +82,12 @@ People's names, walking positions, and cursors pass through the server to the ot
 - `backend/` is the server, a Cloudflare Durable Object. See `backend/README.md`.
 
 Run `npm install`, then `npm run dev` to serve the driver on port 5173 for Drawdy's dev server link. Run `npm test` and `npm run typecheck` before you push.
+
+### Run it from source
+
+1. Clone this repository, run `npm install`, then `npm run dev`. It prints the dev server URL, `http://localhost:5173` by default.
+2. In Drawdy, open a **local** board. Development links do not work on cloud boards.
+3. Open the command palette with `Ctrl+K` (`Cmd+K` on macOS), run **Add extension dev server**, and enter `http://localhost:5173`.
+4. Click the house button on the right edge of the board. Drawdy reloads the extension each time you save.
+
+The driver talks to the deployed server named in `src/config.ts`, so you do not need to run the backend to try it. To run your own, see `backend/README.md`.
