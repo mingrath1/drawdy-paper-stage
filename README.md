@@ -4,9 +4,9 @@ Paper Stage turns a floor plan drawn on your board into a 3D place you and your 
 
 Install the extension, click the house button, then click into the 3D view and walk with WASD.
 
-![A two-room floor plan on a Drawdy board standing up in the Paper Stage 3D view, with a doodle and a sticky note as paper cutouts.](assets/demo.gif)
+![A floor plan drawn on a dark Drawdy board tips back and its walls grow out of the floor in the Paper Stage 3D view, then one click on the real board docks the view beside the plan.](assets/demo.gif)
 
-Watch the [full demo video](assets/demo.mp4).
+Watch the [full demo video](assets/demo.mp4) (47 s, with sound). Its 3D shots are drawn by Paper Stage's own view, and the teammates in it are test scripts.
 
 ## How to use
 
