@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.2
+
+- The README now explains how to install Paper Stage from the Drawdy store and how to run it from source. The extension itself is unchanged.
+
 ## 1.0.1
 
 - New demo film and listing GIF. The extension itself is unchanged from 1.0.0.
