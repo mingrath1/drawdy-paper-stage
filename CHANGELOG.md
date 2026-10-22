@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.1
+
+- New demo film and listing GIF. The extension itself is unchanged from 1.0.0.
+
 ## 1.0.0
 
 - First release. The house button adds a Paper Stage frame with a starter two-room floor plan and opens a 3D view of it.
